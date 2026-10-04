@@ -15,7 +15,7 @@ services:
       dockerfile: Dockerfile
     # To use an image from Container Registry instead of building: set MCP_IMAGE in .env, then
     #   docker login vcr.vngcloud.vn && docker compose pull && docker compose up -d
-    image: ${MCP_IMAGE:-restaurant-mcp-server:latest}
+    image: ${MCP_IMAGE:-restaurant-mcp-server:1.0.0}
     restart: unless-stopped
     environment:
       PORT: "8080"
@@ -52,7 +52,7 @@ services:
   # Caddy keeps the plain MCP port on loopback.
   caddy:
     profiles: ["tls"]
-    image: caddy:2
+    image: caddy:2.11.6
     restart: unless-stopped
     depends_on:
       mcp:

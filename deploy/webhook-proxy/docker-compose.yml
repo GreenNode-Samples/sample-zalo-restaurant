@@ -12,13 +12,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: zalo-webhook-proxy:latest
+    image: zalo-webhook-proxy:1.0.0
     restart: unless-stopped
     environment:
       WEBHOOK_DOMAIN: ${WEBHOOK_DOMAIN:?set WEBHOOK_DOMAIN in .env}
       RUNTIME_UPSTREAM: ${RUNTIME_UPSTREAM:?set RUNTIME_UPSTREAM in .env}
       MAX_BODY: ${MAX_BODY:-64KB}
-      RATE_EVENTS: ${RATE_EVENTS:-300}
+      RATE_EVENTS: ${RATE_EVENTS:-6000}
     ports:
       - "80:80"
       - "443:443"

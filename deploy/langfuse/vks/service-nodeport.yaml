@@ -1,0 +1,33 @@
+# Private access to Langfuse web (port 3000) without a load balancer: a NodePort on the worker
+# nodes, reachable inside the customer VPC by the agent runtime (private connection) and by
+# admins over the VPN. The chart's own web Service stays ClusterIP.
+# Apply AFTER `helm install` (the selector matches the chart's web pods, release name `langfuse`).
+#
+# Langfuse is then at http://<node-private-ip>:30300 (`kubectl get nodes -o wide`, column
+# INTERNAL-IP): use that URL for LANGFUSE_HOST and langfuse.nextauth.url.
+# Requirements:
+#   - the worker nodes have no public IP, or their security group blocks 30300 from the Internet;
+#   - the node security group allows TCP 30300 only from the agent source range and the VPN
+#     client range.
+#
+# An internal load balancer needs a GreenNode annotation that this repository does not verify,
+# so none is guessed here: a LoadBalancer Service created without it may get a PUBLIC address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: langfuse-web-nodeport
+  namespace: langfuse
+  labels:
+    app.kubernetes.io/name: langfuse
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: langfuse
+    app.kubernetes.io/instance: langfuse
+    app: web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      nodePort: 30300       # default NodePort range is 30000-32767
+      protocol: TCP

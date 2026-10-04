@@ -1,7 +1,8 @@
 # Optional: restrict who can reach the Langfuse web pods (port 3000). Requires a CNI that enforces
 # NetworkPolicy. Allow the AgentBase source range (the AgentBase VPC, and the subnet selected for the Private
-# runtime in case of source NAT), the VPN client range and the internal LB subnet.
-# UNVERIFIED: the source address pods see (LB SNAT) depends on the GreenNode load balancer: verify.
+# runtime in case of source NAT), the VPN client range and the worker node subnet.
+# UNVERIFIED: through a NodePort (externalTrafficPolicy Cluster) pods may see a node address
+# instead of the caller's, which is why the node subnet is listed: verify the visible source.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -23,7 +24,7 @@ spec:
         - ipBlock:
             cidr: 10.8.0.0/24         # example: OpenVPN client range (replace)
         - ipBlock:
-            cidr: 10.20.3.0/24        # example: internal LB / node subnet (replace)
+            cidr: 10.20.3.0/24        # example: worker node subnet (replace)
       ports:
         - protocol: TCP
           port: 3000

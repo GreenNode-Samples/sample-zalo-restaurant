@@ -25,9 +25,10 @@ langfuse:
     signUpDisabled: false
 
   nextauth:
-    # URL admins open over the VPN. Set to the internal LB private IP or an internal DNS name
-    # once you know it (see README step 5), e.g. http://10.20.2.30:3000. Must match the browser URL.
-    url: http://langfuse.example.internal:3000
+    # URL admins open over the VPN. Set to the worker node private IP and the NodePort of
+    # service-nodeport.yaml (or an internal DNS name) once you know it (see README step 5),
+    # e.g. http://10.20.2.30:30300. Must match the browser URL.
+    url: http://langfuse.example.internal:30300
     secret:
       secretKeyRef:
         name: langfuse-secrets
@@ -41,8 +42,8 @@ langfuse:
       name: langfuse-secrets
       key: encryption-key
 
-  # NO public ingress. The UI and ingestion endpoint are exposed only through the INTERNAL
-  # load balancer defined in internal-lb-service.yaml (or an internal ingress you configure).
+  # NO public ingress. The UI and ingestion endpoint are exposed only on private addresses: the
+  # NodePort of service-nodeport.yaml (or an internal load balancer / ingress you configure).
   ingress:
     enabled: false
     # If you prefer the documented VKS ingress (ingressClassName "vngcloud", ALB), it must be an
@@ -52,7 +53,7 @@ langfuse:
   web:
     service:
       # ClusterIP on purpose: a LoadBalancer without the internal annotation may get a public
-      # address. internal-lb-service.yaml adds the internal LB explicitly.
+      # address. service-nodeport.yaml adds the private NodePort explicitly.
       type: ClusterIP
       port: 3000
     # Probes use /api/public/health and /api/public/ready (chart defaults).

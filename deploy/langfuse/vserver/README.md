@@ -12,17 +12,17 @@ Admin laptop --- OpenVPN client-to-site (pfSense) ---------->  vServer <private-
 ```
 
 The compose file follows the official Langfuse v3 compose (`langfuse-web`, `langfuse-worker`, `postgres`,
-`clickhouse`, `redis`, `minio`) with images pinned to the v3 major line (`langfuse/langfuse:3`,
-`langfuse/langfuse-worker:3`). It differs from upstream by publishing only `langfuse-web`, only on the private IP,
+`clickhouse`, `redis`, `minio`) with Langfuse pinned to `3.224.1` (`langfuse/langfuse` and `langfuse/langfuse-worker`, the
+release the [VKS Helm chart](../vks/README.md) 1.5.41 deploys) and MinIO pinned by digest. It differs from upstream by publishing only `langfuse-web`, only on the private IP,
 by refusing to start with missing secrets, and by adding log rotation.
 
 > **Verify the version.** The agent uses the Langfuse Python SDK v4 (`langfuse>=4,<5`), which exports traces over
 > OpenTelemetry to `/api/public/otel`. That endpoint exists only in newer Langfuse v3 releases and the SDK documents a
 > minimum server version. Check the Langfuse docs for the minimum server version the SDK requires, then confirm the
 > running version with `curl http://<private-ip>:3000/api/public/health` (the JSON contains `version`). Upstream `main`
-> now ships Langfuse v4 images; if the SDK requires v4, change both tags to `:4` after reading the upgrade notes.
-> The tag `:3` follows the latest 3.x on every `docker compose pull`; for production pin an exact tag
-> (for example `langfuse/langfuse:3.225.11`) and upgrade deliberately.
+> now ships Langfuse v4 images; if the SDK requires v4, change both tags to a v4 release after reading the upgrade notes.
+> The tags are exact on purpose: `docker compose pull` never moves you to a new release, so upgrade deliberately
+> (for example to `3.225.11`, the newest 3.x tag when this was written).
 
 ## 1. Sizing
 
@@ -139,7 +139,7 @@ volumes while the stack is stopped.
 
 1. Read the Langfuse release notes and the self-hosting upgrade guide.
 2. Back up (section 6).
-3. Edit the image tags in `docker-compose.yml` (or keep `:3` and pull), then:
+3. Edit the image tags in `docker-compose.yml`, then:
 
    ```bash
    docker compose pull

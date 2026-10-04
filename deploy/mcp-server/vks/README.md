@@ -1,16 +1,19 @@
 # MCP server on VKS (Kubernetes)
 
 Run the restaurant MCP server (`src/mcp-server`) in a **VKS** cluster of the customer VPC. The Private MCP Gateway
-reaches it through an **internal load balancer**. Use this instead of [`../vserver`](../vserver/README.md) when the
+reaches it on a **private address** of the VPC. Use this instead of [`../vserver`](../vserver/README.md) when the
 customer already operates VKS.
 
 ```
 Agent (AgentBase Runtime) -> Private MCP Gateway (172.30.0.0/16) -> private connection
-   -> https://<internal-lb-ip>:<port>/mcp  (internal LB / ingress, TLS terminated here)
+   -> http://<node-private-ip>:30080/mcp  (NodePort, see "Make it reachable from the gateway")
    -> Service restaurant-mcp-server -> 1 Pod :8080 -> PVC (SQLite)
 ```
 
-The connector URL is an **HTTPS** URL (the docs describe a full HTTPS URL), so TLS must be terminated in front of the pod; see the TODO list.
+**TLS is not part of these manifests.** The pod speaks plain HTTP on `8080`, while the GreenNode documentation describes the
+connector endpoint as a full HTTPS URL. Whether the connector accepts `http://`, and how a certificate would be terminated on
+VKS (internal load balancer, ingress), is not verified in this repository: see "TLS" below. The vServer variant
+([`../vserver`](../vserver/README.md), Caddy on `:8443`) is the documented HTTPS path.
 
 | File | Purpose |
 |---|---|
@@ -18,7 +21,8 @@ The connector URL is an **HTTPS** URL (the docs describe a full HTTPS URL), so T
 | `secret.example.yaml` | Example `MCP_API_KEYS` secret (prefer `kubectl create secret`) |
 | `pvc.yaml` | 5 Gi `ReadWriteOnce` claim for the SQLite database |
 | `deployment.yaml` | 1 replica (`Recreate`), non-root, read-only root filesystem, `/health` probes, PVC on `/app/data` |
-| `service.yaml` | `LoadBalancer` with an internal-LB annotation TODO, plus a `NodePort` alternative |
+| `service.yaml` | `ClusterIP` Service: internal to the cluster, cannot create a public address |
+| `service-nodeport.yaml` | `NodePort` (30080) Service to apply instead, so the gateway can reach the server on the worker nodes' private IPs |
 | `networkpolicy.yaml` | Optional: ingress only from `172.30.0.0/16` (and ranges you add) |
 
 ## Why one replica
@@ -52,26 +56,41 @@ kubectl apply -f namespace.yaml
 export MCP_KEY=$(openssl rand -hex 32)       # RECORD IT, you store the same value in Access Control
 kubectl -n restaurant-mcp create secret generic restaurant-mcp-secret --from-literal=MCP_API_KEYS="$MCP_KEY"
 
-# 4. Volume, Deployment, Service
+# 4. Volume, Deployment, Service (ClusterIP: nothing is reachable from outside the cluster yet)
 kubectl apply -f pvc.yaml -f deployment.yaml -f service.yaml
 kubectl -n restaurant-mcp rollout status deploy/restaurant-mcp-server
 
-# 5. Optional NetworkPolicy
-kubectl apply -f networkpolicy.yaml
+# 5. Make it reachable from the gateway: NodePort on the worker nodes (see the next section)
+kubectl apply -f service-nodeport.yaml
+kubectl get nodes -o wide                                    # INTERNAL-IP = the private address of a worker node
 
-# 6. Internal LB address
-kubectl -n restaurant-mcp get svc restaurant-mcp-server      # EXTERNAL-IP = private IP of the LB
+# 6. Optional NetworkPolicy
+kubectl apply -f networkpolicy.yaml
 ```
+
+## Make it reachable from the gateway
+
+The gateway runs in the AgentBase VPC and needs a **private** address of your VPC. `service.yaml` is `ClusterIP` on purpose: a
+`LoadBalancer` Service created without the right annotation may get a public address, and this server must never be on the Internet.
+
+- **NodePort (provided)**: `service-nodeport.yaml` exposes port `30080` on every worker node. The connector URL is
+  `http://<node-private-ip>:30080/mcp`. The worker nodes must not be reachable from the Internet on that port (no public IP, or a
+  security group that closes it), and their security group must allow TCP `30080` only from the gateway source range.
+- **Internal load balancer**: GreenNode's vLB / VKS documentation reviewed for this sample describes no annotation that makes a
+  Service load balancer internal, so none is shipped. Get the exact annotation from GreenNode, add it to a `LoadBalancer` Service
+  yourself, and check that the address it gets is private before you point the connector at it.
+
+## TLS
+
+The server does not terminate TLS. The documentation describes the connector endpoint as a full HTTPS URL, and an `http://` endpoint
+is an unverified alternative: ask GreenNode whether the connector accepts it, and how an internal or custom CA is provided. If HTTPS
+is required, terminate it in front of the pod (a reverse proxy such as the Caddy used in [`../vserver`](../vserver/README.md), an
+ingress, or a load balancer with a certificate you control) and point the connector at that `https://` URL; none of those is
+provided or tested here for VKS.
 
 ## TODO before real use
 
-- [ ] **Internal LB annotation** in `service.yaml`: add the annotation that makes the GreenNode load balancer internal
-      (per the GreenNode vLB / VKS documentation). Without it the LB may get a public address; do not expose this
-      server to the Internet.
-- [ ] **TLS (required for the HTTPS connector URL)**: terminate TLS at the internal LB or at an Ingress (the documented
-      Ingress supports TLS on port 443 with a certificate or TLS secret), expose `https://<internal-lb-ip>:<port>/mcp`
-      and confirm with GreenNode which CA the gateway trusts. The Service in `service.yaml` speaks plain HTTP on `8080`
-      behind that terminator; use it directly (`http://`) only as an unverified alternative or for tests inside the VPC.
+- [ ] **Connector scheme and TLS**: confirm with GreenNode that the connector accepts `http://`, or put a TLS terminator in front (see "TLS").
 - [ ] **StorageClass** in `pvc.yaml`.
 - [ ] **NetworkPolicy**: confirm the source address seen by the pod (SNAT or not), then adjust the CIDRs.
 
@@ -79,12 +98,12 @@ kubectl -n restaurant-mcp get svc restaurant-mcp-server      # EXTERNAL-IP = pri
 
 1. **Access Control**: API Key provider `restaurant-mcp-key` with the value of `$MCP_KEY`.
 2. **Gateway**: Network mode **Private** (VPC + Subnet of the cluster/LB; DNS resolution on), Inbound Auth = IAM Permissions.
-3. **Connector** `restaurant`: Endpoint `https://<internal-lb-ip>:<port>/mcp` (plain `http://<ip>:8080/mcp` only as an unverified alternative), Outbound Auth = **API Key**, header key
+3. **Connector** `restaurant`: Endpoint `http://<node-private-ip>:30080/mcp` (an unverified alternative to the HTTPS URL the docs describe: see "TLS"), Outbound Auth = **API Key**, header key
    `X-Api-Key`, **empty header value prefix** (the console default `Bearer ` would break the key), provider `restaurant-mcp-key`.
 4. **Policy Group**: allow the seven `restaurant__*` actions for the agent principal (see the root README).
 
-Verify from a host in the VPC: `MCP_HOST=<internal-lb-ip> MCP_PORT=<port> MCP_API_KEY=$MCP_KEY INSECURE=1 ../../check_connectivity.sh`
-(defaults to HTTPS; add `MCP_SCHEME=http MCP_PORT=8080` only to test the plain Service before TLS is in place).
+Verify from a host in the VPC: `MCP_HOST=<node-private-ip> MCP_SCHEME=http MCP_PORT=30080 MCP_API_KEY=$MCP_KEY ../../check_connectivity.sh`
+(the script defaults to HTTPS on 8443; use `MCP_SCHEME=https` and your port once a TLS terminator is in place).
 
 ## Backups, rotation, updates
 

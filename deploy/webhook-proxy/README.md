@@ -64,10 +64,13 @@ Settings in `.env`:
 | `WEBHOOK_DOMAIN` | required | Public DNS name; the certificate is issued for it |
 | `RUNTIME_UPSTREAM` | required | Runtime private endpoint, `http://<runtime-private-endpoint>:8080` (the address is not documented: ask GreenNode) |
 | `MAX_BODY` | `64KB` | Requests above this size get `413` |
-| `RATE_EVENTS` | `300` | Requests per minute per client IP, above that `429` |
+| `RATE_EVENTS` | `6000` | Requests per minute per client IP, above that `429` |
 
-Zalo sends events from its own servers, so a per-IP limit protects against floods from a single address while staying
-well above normal webhook traffic. Tune `RATE_EVENTS` after observing real traffic.
+The limit is keyed per client IP, and Zalo delivers **every guest's** message from its own servers, which are only a few
+addresses. All guests therefore share one or a few counters: a small limit would answer real guests with `429`, and Zalo
+retries a rejected event. `6000` per minute (100 per second) is a flood guard far above any realistic restaurant traffic;
+it is not a per-guest limit, and the agent's own throughput is bounded by `ZALO_MAX_WORKERS`. Look at the access log after
+a busy day and tune `RATE_EVENTS` from real traffic. The Zalo secret, not this limit, is what authenticates a call.
 
 **Own certificate (enterprise CA or purchased):** mount it (`./certs`) and enable the `tls /certs/fullchain.pem
 /certs/privkey.pem` line in the `Caddyfile`. **Header host:** `header_up Host {upstream_hostport}` sends the upstream's

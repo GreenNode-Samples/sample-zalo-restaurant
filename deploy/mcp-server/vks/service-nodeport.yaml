@@ -1,0 +1,27 @@
+# Alternative to service.yaml: expose the MCP server on a fixed port of every worker node.
+# Apply it INSTEAD of service.yaml (same Service name; `kubectl apply` switches the type):
+#
+#   kubectl apply -f service-nodeport.yaml
+#
+# The connector then points at a worker node's PRIVATE IP: http://<node-private-ip>:30080/mcp
+# (`kubectl get nodes -o wide`, column INTERNAL-IP). Requirements:
+#   - the worker nodes have no public IP, or their security group blocks 30080 from the Internet;
+#   - the node security group allows TCP 30080 only from the gateway source range;
+#   - the connector accepts plain `http://` (the GreenNode docs describe an HTTPS URL, see README.md).
+apiVersion: v1
+kind: Service
+metadata:
+  name: restaurant-mcp-server
+  namespace: restaurant-mcp
+  labels:
+    app: restaurant-mcp-server
+spec:
+  type: NodePort
+  selector:
+    app: restaurant-mcp-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30080       # default NodePort range is 30000-32767
+      protocol: TCP

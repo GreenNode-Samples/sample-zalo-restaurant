@@ -1,5 +1,12 @@
-# Service the Private MCP Gateway calls (from the AgentBase VPC) through an INTERNAL load balancer
-# in the customer VPC. It must never be exposed to the Internet.
+# Internal-only Service for the restaurant MCP server: it is reachable inside the cluster and
+# nowhere else, so applying this file can never create a public address.
+#
+# The Private MCP Gateway runs in the AgentBase VPC, so it needs a PRIVATE address of your VPC
+# to call. Pick one (see "Make it reachable from the gateway" in README.md):
+#   - service-nodeport.yaml (this folder): replaces this Service with a NodePort, reachable on
+#     the private IPs of the worker nodes.
+#   - an internal load balancer: needs a GreenNode annotation that this repository does not
+#     verify, so none is guessed here.
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,35 +14,12 @@ metadata:
   namespace: restaurant-mcp
   labels:
     app: restaurant-mcp-server
-  # TODO: add the annotation that makes the GreenNode load balancer INTERNAL (and selects its
-  # subnet), per the GreenNode vLB / VKS documentation. Do not guess the annotation name: the
-  # public VKS docs reviewed for this sample document `vks.vngcloud.vn/load-balancer-id` and
-  # `vks.vngcloud.vn/certificate-ids` (Ingress) but no internal-LB annotation for Services.
-  # Without it the load balancer may be created with a public address.
-  # annotations:
-  #   <annotation-internal-lb>: "<value>"
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: restaurant-mcp-server
   ports:
     - name: http
-      port: 8080            # plain HTTP inside the VPC. The connector URL is HTTPS: terminate TLS at the
-                            # internal LB / ingress and expose it as https://<internal-lb-ip>:<port>/mcp
+      port: 8080            # plain HTTP: TLS is not terminated by these manifests (see README.md)
       targetPort: http
       protocol: TCP
-
-# ---------------------------------------------------------------------------
-# Alternative: NodePort (when no internal LB is available yet). Replace `type: LoadBalancer`
-# above with NodePort and point the connector at a worker node's PRIVATE IP:
-# http://<node-private-ip>:30080/mcp. The node security group must allow the gateway source
-# range to port 30080 only.
-#
-#   spec:
-#     type: NodePort
-#     ports:
-#       - name: http
-#         port: 8080
-#         targetPort: http
-#         nodePort: 30080     # default range 30000-32767
-# ---------------------------------------------------------------------------

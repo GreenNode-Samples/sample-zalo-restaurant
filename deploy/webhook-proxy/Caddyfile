@@ -8,7 +8,9 @@
 #   WEBHOOK_DOMAIN    public DNS name of this proxy (certificate is issued for it)
 #   RUNTIME_UPSTREAM  private endpoint of the runtime, e.g. http://<runtime-private-endpoint>:8080 (verify with GreenNode)
 #   MAX_BODY          request size limit (default 64KB)
-#   RATE_EVENTS       allowed requests per minute per client IP (default 300)
+#   RATE_EVENTS       allowed requests per minute per client IP (default 6000). Zalo delivers every guest's
+#                     message from a handful of egress IPs, so this counts ALL guests together: keep it a
+#                     flood guard, far above real traffic (a 429 makes Zalo retry the event)
 {
 	# The rate_limit directive comes from the caddy-ratelimit module (see Dockerfile).
 	order rate_limit before basicauth
@@ -37,7 +39,7 @@
 		rate_limit {
 			zone per_ip {
 				key {remote_host}
-				events {$RATE_EVENTS:300}
+				events {$RATE_EVENTS:6000}
 				window 1m
 			}
 		}

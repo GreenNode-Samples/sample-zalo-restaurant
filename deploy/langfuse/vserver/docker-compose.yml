@@ -3,7 +3,7 @@
 # Based on the official Langfuse v3 docker-compose
 # (https://github.com/langfuse/langfuse/blob/v3/docker-compose.yml). Differences made for a
 # private production-style deployment:
-#   - image tags pinned to the v3 major line (langfuse/langfuse:3, langfuse/langfuse-worker:3)
+#   - Langfuse images pinned to 3.224.1 (the release the VKS Helm chart 1.5.41 deploys) and MinIO pinned by digest
 #   - only langfuse-web is published, and only on the vServer PRIVATE IP (LANGFUSE_BIND_ADDR)
 #   - postgres, clickhouse, redis, minio and the worker publish NO ports (internal network only)
 #   - every secret is mandatory (no insecure defaults), see .env.example
@@ -80,7 +80,7 @@ x-langfuse-env: &langfuse-env
 
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3
+    image: docker.io/langfuse/langfuse-worker:3.224.1
     restart: unless-stopped
     logging: *default-logging
     depends_on: *langfuse-depends-on
@@ -88,7 +88,7 @@ services:
       <<: *langfuse-env
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:3
+    image: docker.io/langfuse/langfuse:3.224.1
     restart: unless-stopped
     logging: *default-logging
     depends_on: *langfuse-depends-on
@@ -134,8 +134,11 @@ services:
       start_period: 5s
 
   minio:
-    # Same image as upstream. Pin it by digest after you validate it in your environment.
-    image: cgr.dev/chainguard/minio
+    # Same image as upstream, pinned by digest (the multi-arch index of `latest` on 2026-10-04).
+    # Chainguard's free images only publish a rolling `latest` tag, so the digest is the pin;
+    # to update, run `docker buildx imagetools inspect cgr.dev/chainguard/minio:latest`, validate
+    # the new image and replace the digest.
+    image: cgr.dev/chainguard/minio@sha256:4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034
     restart: unless-stopped
     logging: *default-logging
     entrypoint: sh
