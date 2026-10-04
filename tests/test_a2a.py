@@ -1,4 +1,4 @@
-"""A2A protocol (agent card + JSON-RPC message/send) — unit tests, không cần mạng."""
+"""A2A protocol (agent card + JSON-RPC message/send): unit tests, no network."""
 
 # ── agent card (discovery: GET /.well-known/agent-card.json) ──
 def test_a2a_card_shape():
@@ -10,7 +10,7 @@ def test_a2a_card_shape():
     assert card["preferredTransport"] == "JSONRPC"
     assert card["url"].endswith("/a2a")
     caps = card["capabilities"]
-    assert caps["streaming"] is False  # zalo chỉ hỗ trợ message/send
+    assert caps["streaming"] is False  # only message/send is supported
     assert card["defaultInputModes"] == ["text/plain"]
     assert card["defaultOutputModes"] == ["text/plain"]
 
@@ -25,7 +25,7 @@ def test_a2a_card_skills():
         assert s["name"] and s["description"] and s.get("tags")
 
 
-# ── _a2a_text: trích text từ message.parts ──
+# ── _a2a_text: extract the text from message.parts ──
 def test_a2a_text_kind_text():
     import main
 
@@ -62,7 +62,7 @@ def test_a2a_text_empty():
     assert main._a2a_text({"message": {"parts": []}}) == ""
 
 
-# ── LangFuse v4 helpers: tracing tắt khi thiếu env (chạy bình thường) ──
+# ── LangFuse v4 helpers: tracing is off when env vars are missing (the turn runs normally) ──
 def test_lf_helpers_off_without_env(monkeypatch):
     import main
 
@@ -70,5 +70,5 @@ def test_lf_helpers_off_without_env(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     assert main._lf_tracing() is False
     with main._lf_scope("t", "u", "s", ["x"]):
-        pass  # nullcontext → không raise
+        pass  # nullcontext -> does not raise
     assert main._lf_callback() is None

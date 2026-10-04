@@ -1,8 +1,8 @@
-"""Memory headers: thiếu X-GreenNode-AgentBase-User-Id / -Session-Id → 400, KHÔNG fallback default.
+"""Memory headers: a missing X-GreenNode-AgentBase-User-Id / -Session-Id -> 400, NO default fallback.
 
-Docs AgentBase: "If your agent uses memory, validate that these headers are present and
+AgentBase docs: "If your agent uses memory, validate that these headers are present and
 return an error if missing. Do not fall back to default values."
-(Webhook Zalo không thuộc diện này: actor/session lấy từ sender_id/chat_id của Zalo.)
+(The Zalo webhook is not covered: its actor/session come from Zalo's sender_id/chat_id.)
 """
 import pytest
 from starlette.testclient import TestClient
@@ -18,7 +18,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "AGENT_API_KEY", "")
 
     def _boom(*a, **k):
-        raise AssertionError("agent KHÔNG được chạy khi thiếu headers")
+        raise AssertionError("the agent must NOT run when the headers are missing")
 
     monkeypatch.setattr(main.agent_mod, "get_agent", _boom)
     return TestClient(main.app, raise_server_exceptions=False)
