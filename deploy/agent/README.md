@@ -76,7 +76,7 @@ The API reference in the documentation reviewed for this sample does not list th
 | `AGENTBASE_MEMORY_ID` | yes | `memory-...` | no |
 | `MEMORY_STRATEGY_ID` | yes | `ltms-...` (the `customer-profile` CUSTOM strategy) | no |
 | `MCP_RESTAURANT_URL` | yes | the **connector URL of the Private gateway**: the gateway **Endpoint URL** from its detail page followed by `/restaurant` | no |
-| `LANGFUSE_HOST` | yes (for traces) | `http://<langfuse-private-ip>:3000` (vServer private IP or internal LB IP) | no |
+| `LANGFUSE_HOST` | yes (for traces) | `http://<langfuse-private-ip>:3000` (vServer private IP), or `http://<node-private-ip>:30300` on VKS ([`../langfuse/vks`](../langfuse/vks/README.md)) | no |
 | `LANGFUSE_PUBLIC_KEY` | yes (for traces) | `pk-lf-...` | low |
 | `LANGFUSE_SECRET_KEY` | yes (for traces) | `sk-lf-...` | **yes** |
 | `ZALO_BOT_TOKEN` | for real Zalo | `<id>:<secret>` from Zalo Bot Creator | **yes** |

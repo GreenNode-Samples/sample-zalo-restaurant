@@ -15,12 +15,62 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: |
-          pip install -r src/backend/requirements.txt
-          pip install -r src/mcp-server/requirements.txt
-          pip install pytest
+          pip install -r src/backend/requirements.txt -r src/mcp-server/requirements.txt
+          pip install pytest ruff pyyaml
+      - name: Lint (ruff)
+        run: ruff check --select F,E9,B,UP,SIM --target-version py312 src tests
       - name: Run tests
         run: pytest -q
       - name: Syntax check frontend
         run: node --check src/frontend/app.js
-      - name: Syntax check deploy scripts
-        run: bash -n deploy/check_connectivity.sh
+      - name: Check deploy scripts (bash -n, shellcheck)
+        run: |
+          bash -n deploy/check_connectivity.sh
+          shellcheck deploy/check_connectivity.sh
+      - name: Parse Kubernetes and Helm YAML
+        run: |
+          python - <<'PY'
+          import glob
+          import yaml
+
+          files = sorted(glob.glob("deploy/**/vks/*.yaml", recursive=True))
+          for path in files:
+              with open(path) as f:
+                  list(yaml.safe_load_all(f))
+              print("ok", path)
+          assert files, "no YAML found"
+          PY
+
+  compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate every compose file
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config -q
+          (cd deploy/mcp-server/vserver && MCP_API_KEYS=x docker compose --profile tls config -q)
+          (cd deploy/webhook-proxy && WEBHOOK_DOMAIN=example.com RUNTIME_UPSTREAM=http://runtime:8080 docker compose config -q)
+          (cd deploy/langfuse/vserver && \
+            LANGFUSE_BIND_ADDR=10.0.0.1 NEXTAUTH_URL=http://10.0.0.1:3000 NEXTAUTH_SECRET=x SALT=x ENCRYPTION_KEY=x \
+            POSTGRES_PASSWORD=x CLICKHOUSE_PASSWORD=x REDIS_AUTH=x MINIO_ROOT_PASSWORD=x docker compose config -q)
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the agent image
+        run: docker build -t zalo-restaurant-bot:ci .
+      - name: Build the MCP server image
+        run: docker build -t restaurant-mcp-server:ci src/mcp-server
+      - name: Build the webhook proxy image and validate its Caddyfile
+        run: |
+          docker build -t zalo-webhook-proxy:ci deploy/webhook-proxy
+          docker run --rm -e WEBHOOK_DOMAIN=example.com -e RUNTIME_UPSTREAM=http://runtime:8080 \
+            -v "$PWD/deploy/webhook-proxy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            zalo-webhook-proxy:ci caddy validate --config /etc/caddy/Caddyfile
+      - name: Validate the MCP server TLS Caddyfile
+        run: |
+          docker run --rm -e CADDY_SITE=10.0.0.1 \
+            -v "$PWD/deploy/mcp-server/vserver/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.11.6 caddy validate --config /etc/caddy/Caddyfile

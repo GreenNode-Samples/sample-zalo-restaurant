@@ -58,7 +58,7 @@ Guest (Zalo app)
         `-- MCP Gateway (Private)  Inbound Auth: IAM
               -> Policy Group  (allow only the agent principal, only restaurant__* actions)
               -> connector `restaurant`  Outbound Auth: API Key (header X-Api-Key, secret in Access Control)
-              -> MCP server (customer VPC, vServer or VKS) over HTTPS: https://<mcp-private-ip>:8443/mcp ; SQLite on a persistent volume
+              -> MCP server (customer VPC, vServer or VKS); vServer + Caddy: https://<mcp-private-ip>:8443/mcp ; VKS: plain HTTP on a private NodePort (no TLS included) ; SQLite on a persistent volume
 Reply path (outbound from the runtime, not through the proxy):
   Agent Runtime --HTTPS sendMessage--> Zalo Bot Platform (Internet)     needs outbound Internet egress (verify with GreenNode)
 Admin laptop -> client-to-site VPN (pfSense OpenVPN) -> Langfuse UI on a private IP
@@ -80,8 +80,8 @@ Private runtime has egress: see [Verify with GreenNode](#verify-with-greennode) 
 |---|---|---|---|---|
 | **Agent** (`src/backend`, root `Dockerfile`) | **AgentBase** Agent Runtime, only the agent image | **Private** mode: customer VPC + Subnet + Route CIDRs; calls out to Zalo, LLM and AgentBase APIs over HTTPS (egress: verify) | inbound: webhook proxy and admin range (IP Access Control) | [`deploy/agent`](deploy/agent/README.md) |
 | **MCP Gateway** + Policy Group + connector `restaurant` | **AgentBase** (managed) | **Private** mode, attached to the customer VPC (DNS resolution on) | the agent (Inbound Auth IAM) | [Step 3](#deployment-steps) below |
-| Memory, LLM | **AgentBase** / GreenNode AIP | managed | the agent | travel-buddy README steps 1 to 2 |
-| **MCP server** (`src/mcp-server`) | **customer VPC, private subnet**: vServer (docker compose) or VKS | no public IP; SQLite on a named volume / PVC | only the gateway source range (`172.30.0.0/16`, or the VPC range if NAT'd; verify), over HTTPS (`:8443` on vServer) | [`deploy/mcp-server/vserver`](deploy/mcp-server/vserver/README.md) · [`deploy/mcp-server/vks`](deploy/mcp-server/vks/README.md) |
+| Memory, LLM | **AgentBase** / GreenNode AIP | managed | the agent | [sample-travel-buddy](https://github.com/greennode-samples/sample-travel-buddy/blob/main/README.md) README, steps 1 to 2 |
+| **MCP server** (`src/mcp-server`) | **customer VPC, private subnet**: vServer (docker compose) or VKS | no public IP; SQLite on a named volume / PVC | only the gateway source range (`172.30.0.0/16`, or the VPC range if NAT'd; verify); HTTPS on vServer (`:8443`, Caddy), plain HTTP on VKS (private NodePort, TLS not included) | [`deploy/mcp-server/vserver`](deploy/mcp-server/vserver/README.md) · [`deploy/mcp-server/vks`](deploy/mcp-server/vks/README.md) |
 | **Langfuse v3** (web, worker, postgres, clickhouse, redis, minio) | **customer VPC, private subnet**: vServer (compose) or VKS (Helm) | bound to private IPs, **no public IP** | agent path and VPN client range, port 3000 only | [`deploy/langfuse/vserver`](deploy/langfuse/vserver/README.md) · [`deploy/langfuse/vks`](deploy/langfuse/vks/README.md) |
 | **Webhook proxy** (Caddy, or vLB/ALB) | **customer VPC, public subnet**, public IP | exposes only `POST /webhook/zalo`; all else 404 | Zalo (Internet) | [`deploy/webhook-proxy`](deploy/webhook-proxy/README.md) |
 | **VPN server** (pfSense OpenVPN) | **customer VPC, public subnet**, Floating IP | UDP 1194 (or TCP 443) | administrators | [`deploy/admin-vpn`](deploy/admin-vpn/README.md) |
@@ -143,24 +143,24 @@ needs the **AgentBase private connection** (VPC peering) to be activated for you
 ## Deployment steps
 
 Do the steps in this order. Portal: **https://aiplatform.console.vngcloud.vn** (AgentBase) and the vServer / VKS consoles for the VPC resources.
-The LLM key and Memory (Steps 1 to 2 of the [sample-travel-buddy](../sample-travel-buddy) README) are created the same way; here the memory has one CUSTOM strategy
+The LLM key and Memory (Steps 1 to 2 of the [sample-travel-buddy](https://github.com/greennode-samples/sample-travel-buddy/blob/main/README.md) README) are created the same way; here the memory has one CUSTOM strategy
 named `customer-profile`.
 
 0. **Prerequisites and CIDR plan.**
    - Ask GreenNode support to **activate the AgentBase private connection** for your VPC (required for Private runtimes and gateways).
    - Choose non-overlapping ranges: customer VPC (for example `10.20.0.0/16`), VPN tunnel network (for example `10.8.0.0/24`), and nothing inside `172.30.0.0/16`.
    - Create subnets: a **private** subnet (MCP server, Langfuse, agent runtime) and a **public** subnet (webhook proxy, pfSense). Enable **DNS resolution** on the VPC.
-1. **LLM key and Memory** (`AGENTBASE_MEMORY_ID`, `MEMORY_STRATEGY_ID`): as in the travel-buddy README.
+1. **LLM key and Memory** (`AGENTBASE_MEMORY_ID`, `MEMORY_STRATEGY_ID`): as in the [sample-travel-buddy](https://github.com/greennode-samples/sample-travel-buddy/blob/main/README.md) README.
 2. **MCP server in the customer VPC**: [`deploy/mcp-server/vserver`](deploy/mcp-server/vserver/README.md) (docker compose) **or**
-   [`deploy/mcp-server/vks`](deploy/mcp-server/vks/README.md) (Kubernetes). Generate `MCP_API_KEYS` (`openssl rand -hex 32`) and record it. Expose it over **HTTPS** (Caddy TLS on `:8443` for vServer; LB / ingress TLS for VKS). Security group:
-   the HTTPS port only from the gateway source (`172.30.0.0/16`, or the VPC range if NAT'd: verify). Test with `deploy/check_connectivity.sh`.
+   [`deploy/mcp-server/vks`](deploy/mcp-server/vks/README.md) (Kubernetes). Generate `MCP_API_KEYS` (`openssl rand -hex 32`) and record it. On a vServer Caddy terminates HTTPS on `:8443`; the VKS manifests are `ClusterIP` plus a private NodePort (`30080`) and do **not** terminate TLS (see the VKS README). Security group:
+   the MCP port only from the gateway source (`172.30.0.0/16`, or the VPC range if NAT'd: verify). Test with `deploy/check_connectivity.sh`.
 3. **Private MCP Gateway, connector and policy.**
    1. **Access Control**: create an **API Key** provider `restaurant-mcp-key` whose value is exactly the MCP server key.
    2. **MCP Governance > MCP Gateway > Create Gateway**: name `zalo-private-gw`, **Inbound Auth = IAM Permissions**, **Network mode = Private** (the customer VPC and the Subnet of the MCP server;
       DNS resolution on; the network mode cannot be changed afterwards: assumed, verify).
    3. **Add Custom Connector**: Name `restaurant`, Type `MCP`.
-      - **Endpoint**: `https://<mcp-private-ip>:8443/mcp` (vServer with Caddy TLS) or `https://<internal-lb-ip>:<port>/mcp` (VKS, TLS terminated at the internal LB / ingress).
-        The docs describe a full HTTPS URL; plain `http://<ip>:8080/mcp` is an unverified alternative only.
+      - **Endpoint**: `https://<mcp-private-ip>:8443/mcp` (vServer with Caddy TLS) or `http://<node-private-ip>:30080/mcp` (VKS NodePort, no TLS).
+        The docs describe a full HTTPS URL, so a plain `http://` endpoint is an unverified alternative: confirm it with GreenNode, or terminate TLS yourself in front of the VKS service.
       - **Outbound Auth = API Key**, mode **2LO**, provider `restaurant-mcp-key`, **Header key `X-Api-Key`**, **Header value prefix empty** (the default `Bearer ` would break the key).
 
       API form (`targets` is a **full replacement**: include every existing connector):
@@ -254,6 +254,8 @@ These points are **not stated in the public documentation** used for this sample
 
 ## Local development
 
+Requirements: Docker with the Compose plugin to run everything, and Python 3.10 or newer (3.12 recommended: the images use 3.12) to run the tests without Docker.
+
 Run the agent and the MCP server on your machine with docker compose (no gateway, no VPN, no public ingress):
 
 ```bash
@@ -273,7 +275,7 @@ The simulator works 100% without a Zalo token (the UI shows `zalo_configured=fal
 |---|---|---|
 | `LLM_API_KEY` · `LLM_MODEL` | Yes | LLM AIP |
 | `LLM_BASE_URL` | optional | OpenAI-compatible endpoint, default LLM AIP `https://maas-llm-aiplatform-hcm.api.vngcloud.vn/v1`. On AgentBase Runtime may point to the Sidecar LLM Proxy `http://localhost:18080` (verify with GreenNode) |
-| `AGENTBASE_MEMORY_ID` | Yes | `memory-…` (create as in the travel repo Step 2, with **one CUSTOM strategy** named `customer-profile`, prompt: *"Extract the restaurant guest profile: name, phone, food preferences (vegetarian/spicy/allergies), usual table, birthday, visit history."*) |
+| `AGENTBASE_MEMORY_ID` | Yes | `memory-…` (create as in Step 2 of the [sample-travel-buddy](https://github.com/greennode-samples/sample-travel-buddy/blob/main/README.md) README, with **one CUSTOM strategy** named `customer-profile`, prompt: *"Extract the restaurant guest profile: name, phone, food preferences (vegetarian/spicy/allergies), usual table, birthday, visit history."*) |
 | `MEMORY_STRATEGY_ID` | Yes | that strategy's `ltms-…` ID |
 | `MCP_RESTAURANT_URL` | Yes | connector URL of the **Private gateway**: `<gateway-endpoint-url>/restaurant` (local development: `http://mcp-server:8080/mcp`) |
 | `ZALO_BOT_TOKEN` | optional | enables the real Zalo mode (without it `/webhook/zalo` answers `503`) |
@@ -374,9 +376,10 @@ In this deployment Langfuse is **self-hosted and private** in the customer VPC (
 ## Tests
 
 ```bash
-pip install -r src/backend/requirements.txt -r src/mcp-server/requirements.txt pytest
+pip install -r src/backend/requirements.txt -r src/mcp-server/requirements.txt pytest   # Python 3.10+ (3.12 recommended)
 pytest -q                                   # unit tests: MCP server tools + API-key auth, Zalo channel, webhook, REST auth, A2A, memory headers
-bash -n deploy/check_connectivity.sh        # script syntax
+ruff check --select F,E9,B,UP,SIM --target-version py312 src tests   # pip install ruff
+bash -n deploy/check_connectivity.sh        # script syntax (and shellcheck, if installed)
 ```
 
 The MCP server tests use a temporary SQLite database per test and a frozen clock; they cover guest isolation, ownership on cancel, loyalty (no farming), date / hours / capacity validation, the 2-hour table window, idempotent bookings, tool errors (`isError`) and the fail-closed authentication (`503` without a key, `401` for a wrong key, both header styles, `/health` open). The backend tests use a fake agent turn, a fake Zalo sender and `httpx.MockTransport`: no network is needed.
