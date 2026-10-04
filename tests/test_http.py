@@ -566,6 +566,19 @@ def test_bookings_are_listed_for_one_guest(client, monkeypatch):
                       {"name": "list_bookings", "arguments": {"guest_id": "zalo-111"}})]
 
 
+@pytest.mark.parametrize(
+    ("listed", "expected"),
+    [(["list_bookings"], "list_bookings"), (["restaurant__list_bookings"], "restaurant__list_bookings"), ([], "list_bookings")],
+    ids=["bare", "prefixed", "no tools loaded"],
+)
+def test_the_bookings_call_uses_the_name_the_gateway_lists(client, monkeypatch, listed, expected):
+    calls = []
+    monkeypatch.setattr(agent, "get_mcp_tools", lambda: [SimpleNamespace(name=n) for n in listed])
+    monkeypatch.setattr(main, "mcp_request", lambda url, method, params: calls.append(params) or (200, {"result": {"structuredContent": {}}}))
+    assert client.get("/api/bookings", params={"actor": "zalo-111"}).status_code == 200
+    assert calls == [{"name": expected, "arguments": {"guest_id": "zalo-111"}}]
+
+
 def test_bookings_fall_back_to_the_text_content(client, monkeypatch):
     text = '{"bookings": [{"id": "bk-2"}], "truncated": true}'
     monkeypatch.setattr(main, "mcp_request", lambda *a: (200, {"result": {"content": [{"type": "text", "text": text}]}}))

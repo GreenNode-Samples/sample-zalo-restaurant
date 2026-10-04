@@ -265,6 +265,8 @@ docker compose up --build
 # open http://localhost:8080  (Web Simulator, SERVE_UI=true)
 ```
 
+The backend (`python src/backend/main.py`) and the compose file read **only `<repo>/.env`**: no `.env` of a parent directory is ever loaded, and the MCP server reads no `.env` at all (its settings are plain environment variables).
+
 `docker-compose.yml` starts `mcp-server` (with `ALLOW_ANONYMOUS=true`, local use only, SQLite in a named volume) and `agent` with
 `MCP_RESTAURANT_URL=http://mcp-server:8080/mcp`. For local traces run the upstream Langfuse compose separately
 (https://github.com/langfuse/langfuse, folder root `docker-compose.yml`) and set `LANGFUSE_HOST=http://host.docker.internal:3000` and the two keys in `.env`; leave them empty to disable tracing.
@@ -375,6 +377,7 @@ In this deployment Langfuse is **self-hosted and private** in the customer VPC (
 | **Context budget** | `SummarizationMiddleware` replaces old messages by a summary once the history reaches about 16k tokens (it never splits a tool call from its result); a turn is capped at 10 model calls and 8 tool calls (`create_booking` once), and a capped turn answers with a Vietnamese apology; a transient LLM error is retried by `ModelRetryMiddleware` (the only retry layer, `ChatOpenAI` runs with `max_retries=0`) |
 | **Daily sessions** | the Zalo session is `zalo-<chat id>-<YYYYMMDD>` (Vietnam date): the checkpointer reads every event of a session on every turn, so a session that never ends would grow forever. Long-term memory carries the guest across days; one checkpoint is written per turn (`durability="exit"`) |
 | **Guest-scoped tools** | the MCP tools that take a `guest_id` get it from the run config (the Zalo sender id); the argument is removed from the schema the model sees and ignored if the model sends one, so the model cannot read or cancel another guest's bookings. The prompt also requires an explicit "yes" from the guest before `create_booking` / `cancel_booking`, and a `ToolCallLimitMiddleware` allows one `create_booking` per turn |
+| **Gateway tool names** | the gateway may list a tool with a connector prefix (`restaurant__create_booking`). The one-booking limit and the simulator's bookings call resolve the real name from the loaded tool list (exact name, or a `__<name>` suffix, falling back to the bare name); the system prompt keeps the bare names, the model copes with a prefix |
 | **No raw errors** | tool failures reach the model as short messages naming only the exception type; API clients and guests get a generic message plus a request id, never exception text |
 
 ## Tests

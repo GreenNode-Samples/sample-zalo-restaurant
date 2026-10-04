@@ -37,7 +37,10 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
-load_dotenv()  # before the imports below: agent.py reads its configuration from the environment
+# Only the repository's own .env is read (src/backend/main.py -> repo root). load_dotenv() without
+# a path would walk UP the directory tree and could pick up an unrelated .env of a parent folder.
+ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+load_dotenv(ENV_FILE)  # before the imports below: agent.py reads its configuration from the environment
 
 from greennode_agentbase import (  # noqa: E402
     GreenNodeAgentBaseApp,
@@ -730,10 +733,15 @@ async def _webhook_post(request: Request) -> JSONResponse:
 
 # --- GET /api/bookings (simulator panel) -----------------------------------------------------
 
-def _guest_bookings(actor: str) -> list[dict] | None:
-    """Call the MCP tool list_bookings for one guest directly (no LLM). None when it fails."""
+def _guest_bookings(actor: str) -> dict | None:
+    """Call the MCP tool list_bookings for one guest directly (no LLM). None when it fails.
+
+    The gateway may list the tool with a connector prefix (`restaurant__list_bookings`): the name
+    is resolved from the cached tool list, like the agent's own tools.
+    """
+    tool = agent_mod.resolve_tool_name(agent_mod.get_mcp_tools(), "list_bookings")
     status, body = mcp_request(
-        agent_mod.MCP_RESTAURANT_URL, "tools/call", {"name": "list_bookings", "arguments": {"guest_id": actor}}
+        agent_mod.MCP_RESTAURANT_URL, "tools/call", {"name": tool, "arguments": {"guest_id": actor}}
     )
     result = body.get("result") if status == 200 and isinstance(body, dict) else None
     if not isinstance(result, dict) or result.get("isError"):

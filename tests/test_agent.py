@@ -578,3 +578,58 @@ def test_the_agent_has_the_global_and_the_booking_tool_limits(rig, monkeypatch):
         (None, agent.TOOL_CALL_LIMIT, "continue"), ("create_booking", 1, "continue"),
     }
     assert len({m.name for m in limits}) == 2  # distinct names: langchain refuses duplicates
+
+
+# --- gateway tool names may carry the connector prefix ----------------------------------------------
+
+PREFIXED_BOOKING = {**BOOKING_DEF, "name": "restaurant__create_booking"}
+
+
+@pytest.mark.parametrize(
+    ("listed", "expected"),
+    [
+        (["create_booking", "get_menu"], "create_booking"),
+        (["restaurant__create_booking", "restaurant__get_menu"], "restaurant__create_booking"),
+        (["create_booking", "restaurant__create_booking"], "create_booking"),  # the exact name wins
+        (["restaurant__get_menu"], "create_booking"),  # not listed: fall back to the bare name
+        ([], "create_booking"),
+        (["restaurant__recreate_booking", "x_create_booking"], "create_booking"),  # only "__<name>" suffixes match
+    ],
+)
+def test_resolve_tool_name_accepts_both_forms(listed, expected):
+    tools = [type("T", (), {"name": name})() for name in listed]
+    assert agent.resolve_tool_name(tools, "create_booking") == expected
+
+
+@pytest.mark.parametrize("definition", [BOOKING_DEF, PREFIXED_BOOKING], ids=["bare", "prefixed"])
+def test_the_booking_limit_follows_the_listed_tool_name(rig, monkeypatch, definition):
+    captured = {}
+    monkeypatch.setattr(agent, "create_agent", lambda *args, **kwargs: captured.update(kwargs))
+    agent._build_agent(agent._build_tools([definition, MENU_TOOL]))
+    (booking_limit,) = [
+        m for m in captured["middleware"] if isinstance(m, ToolCallLimitMiddleware) and m.tool_name
+    ]
+    assert booking_limit.tool_name == definition["name"]
+
+
+def test_the_booking_limit_falls_back_to_the_bare_name_without_tools(rig, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(agent, "create_agent", lambda *args, **kwargs: captured.update(kwargs))
+    agent._build_agent([])
+    assert {m.tool_name for m in captured["middleware"] if isinstance(m, ToolCallLimitMiddleware)} == {None, "create_booking"}
+
+
+def test_a_second_prefixed_create_booking_is_refused_too(rig):
+    rig.tool_defs = [PREFIXED_BOOKING]
+    name = PREFIXED_BOOKING["name"]
+    rig.model.script = [
+        AIMessage("", tool_calls=[
+            tool_call("c1", name, **booking_args()),
+            tool_call("c2", name, **booking_args(time="20:00")),
+        ]),
+        AIMessage("one table"),
+    ]
+    assert rig.turn("book two tables", user="zalo-111").reply == "one table"
+    assert rig.tool_calls == [(name, booking_args(guest_id="zalo-111"))]  # injected id, one call, prefixed name
+    refused = [m for m in rig.model.seen[-1] if isinstance(m, ToolMessage) and m.status == "error"]
+    assert [m.tool_call_id for m in refused] == ["c2"]

@@ -304,6 +304,15 @@ def _build_tools(tool_defs: list[dict]) -> list[StructuredTool]:
     return tools
 
 
+def resolve_tool_name(tools: list[StructuredTool], bare_name: str) -> str:
+    """The name under which the gateway lists a tool: `bare_name` itself or a connector-prefixed
+    form such as `restaurant__<bare_name>`. Falls back to `bare_name` when it is not listed."""
+    names = [t.name for t in tools]
+    if bare_name in names:
+        return bare_name
+    return next((n for n in names if n.endswith(f"__{bare_name}")), bare_name)
+
+
 _tools_lock = threading.Lock()
 _tools: list[StructuredTool] = []
 _tool_defs: list[dict] = []
@@ -423,7 +432,9 @@ def _build_agent(mcp_tools: list[StructuredTool]):
             ToolCallLimitMiddleware(run_limit=TOOL_CALL_LIMIT, exit_behavior="continue"),
             # A second create_booking in the same turn is refused with an error message.
             ToolCallLimitMiddleware(
-                tool_name=BOOKING_TOOL, run_limit=BOOKING_CALL_LIMIT, exit_behavior="continue"
+                tool_name=resolve_tool_name(mcp_tools, BOOKING_TOOL),
+                run_limit=BOOKING_CALL_LIMIT,
+                exit_behavior="continue",
             ),
             ToolErrorMiddleware(_tool_error_text),
         ],

@@ -45,3 +45,13 @@ def test_the_example_placeholder_of_an_optional_secret_is_rejected(name):
     result = start("main", **{name: "change-me"})
     assert result.returncode != 0 and f"{name} still has" in result.stderr
     assert start("main", **{name: "a-real-secret-value"}).returncode == 0
+
+
+def test_only_the_repositorys_own_env_file_is_read():
+    """load_dotenv() without a path walks up the tree and could load an unrelated .env of a parent folder."""
+    import main
+
+    repo = BACKEND.parent.parent
+    expected = repo / ".env"
+    assert expected == main.ENV_FILE
+    assert (repo / "src" / "backend" / "main.py").is_file()  # the depth (parents[2]) really is the repo root
