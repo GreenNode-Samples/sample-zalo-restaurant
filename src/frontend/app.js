@@ -1,23 +1,23 @@
 /* =========================================================================
- * app.js — Web Simulator cho sample repo
- *         "Zalo Restaurant Bot — bot quán ăn nhớ khách quen"
+ * app.js — Web Simulator for the sample repo
+ *         "Zalo Restaurant Bot — a restaurant bot that remembers its guests"
  *
- * Mô phỏng giao diện chat Zalo OA để dev kiểm thử agent mà không cần Zalo thật.
- * - Thuần vanilla JS, không framework, không build step.
- * - Backend Python SDK serve các file này tĩnh tại GET / (same origin),
- *   nên mọi fetch() đều dùng URL tương đối → không gặp vấn đề CORS.
+ * Simulates the Zalo OA chat UI so developers can test the agent without a real Zalo account.
+ * - Plain vanilla JS, no framework, no build step.
+ * - The Python SDK backend serves these files statically at GET / (same origin),
+ *   so every fetch() uses a relative URL and CORS is not an issue.
  *
- * Hợp đồng API (same origin):
- *   POST /invocations        gửi tin nhắn cho agent
- *   GET  /api/info           thông tin agent (model, memory, zalo_configured…)
- *   GET  /api/memory?actor=  hồ sơ khách theo memory strategy
- *   GET  /api/history?actor=&session=  lịch sử hội thoại (tăng dần theo thời gian)
- *   GET  /api/actors         danh sách khách hàng + các session
- *   GET  /api/bookings       danh sách đặt bàn hiện có
+ * API contract (same origin):
+ *   POST /invocations        send a message to the agent
+ *   GET  /api/info           agent info (model, memory, zalo_configured…)
+ *   GET  /api/memory?actor=  guest profile from the memory strategy
+ *   GET  /api/history?actor=&session=  conversation history (oldest first)
+ *   GET  /api/actors         guests and their sessions
+ *   GET  /api/bookings       current bookings
  * ========================================================================= */
 'use strict';
 
-/* ----- Hằng số endpoint (khớp chính xác với backend) ----- */
+/* ----- Endpoint constants (exactly as the backend serves them) ----- */
 const API = {
   INVOCATIONS: '/invocations',
   INFO:        '/api/info',
@@ -27,42 +27,42 @@ const API = {
   BOOKINGS:    '/api/bookings',
 };
 
-/* Lớp CSS tương ứng với trạng thái đặt bàn (badge màu) */
+/* CSS class for each booking status (coloured badge) */
 const STATUS_CLASS = { CONFIRMED: 'st-confirmed', CANCELLED: 'st-cancelled' };
 
-/* ----- Trạng thái toàn cục của simulator ----- */
+/* ----- Global simulator state ----- */
 const state = {
-  currentActor: null,   // actorId đang chọn (chính là Zalo user id)
-  currentSession: null, // session id đang dùng cho actor đó
-  actors: [],           // cache kết quả /api/actors
-  sending: false,       // chặn gửi đôi khi bot đang trả lời
-  timerId: null,        // interval đếm thời gian chờ bot trả lời
-  pendingStart: 0,      // mốc thời gian bắt đầu chờ
+  currentActor: null,   // selected actorId (this is the Zalo user id)
+  currentSession: null, // session id in use for that actor
+  actors: [],           // cached /api/actors result
+  sending: false,       // blocks a second send while the bot is answering
+  timerId: null,        // interval counting the wait for the bot's answer
+  pendingStart: 0,      // when the wait started
 };
 
-/* ----- Tiện ích DOM ngắn gọn ----- */
+/* ----- Short DOM helper ----- */
 const $ = (id) => document.getElementById(id);
 
-/* escapeHtml: luôn escape nội dung đến từ API/người dùng trước khi nhét vào innerHTML */
+/* escapeHtml: always escape API/user content before putting it into innerHTML */
 function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-/* renderMarkdown: render tối giản **in đậm**, `code`, [link](url) trên chuỗi ĐÃ escape.
-   Chỉ chấp nhận link http/https để tránh injected javascript: URI. */
+/* renderMarkdown: minimal **bold**, `code`, [link](url) on an ALREADY escaped string.
+   Only http/https links are accepted, to avoid an injected javascript: URI. */
 function renderMarkdown(raw) {
   let html = escapeHtml(raw);
   html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
     '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-  html = html.replace(/^\s*[-*]\s+(.*)$/gm, '&bull; $1'); // gạch đầu dòng → bullet
+  html = html.replace(/^\s*[-*]\s+(.*)$/gm, '&bull; $1'); // dash list item -> bullet
   return html.replace(/\n/g, '<br>');
 }
 
-/* relativeTime: "vừa xong", "5 phút trước"… từ chuỗi ISO createdAt */
+/* relativeTime: "vừa xong" (just now), "5 phút trước" (5 minutes ago)… from an ISO createdAt string */
 function relativeTime(iso) {
   if (!iso) return '';
   const time = new Date(iso).getTime();
@@ -78,7 +78,7 @@ function relativeTime(iso) {
   return new Date(iso).toLocaleDateString('vi-VN');
 }
 
-/* ===== Toast lỗi — dải đỏ trên cùng, tự ẩn sau 8s hoặc bấm ✕ để tắt ===== */
+/* ===== Error toast: red strip on top, hides after 8s or on the ✕ button ===== */
 let toastTimer = null;
 
 function showToast(message) {
@@ -93,7 +93,7 @@ function hideToast() {
   clearTimeout(toastTimer);
 }
 
-/* API key (khi backend bật AGENT_API_KEY) — lưu localStorage, tự đính kèm mọi request */
+/* API key (when the backend sets AGENT_API_KEY): kept in localStorage, attached to every request */
 const KEY_STORAGE = 'zalo_bot_api_key';
 function authHeaders(extra = {}) {
   const h = Object.assign({}, extra);
@@ -103,7 +103,7 @@ function authHeaders(extra = {}) {
   return h;
 }
 
-/* fetchJson: wrapper cho fetch — bắn lỗi tiếng Việt dễ hiểu để đưa lên toast */
+/* fetchJson: fetch wrapper that throws readable (Vietnamese) errors for the toast */
 async function fetchJson(url, options = {}) {
   options.headers = authHeaders(options.headers || {});
   let res;
@@ -113,19 +113,19 @@ async function fetchJson(url, options = {}) {
     throw new Error(`Không gọi được ${url} — backend đã chạy chưa?`);
   }
   let data = null;
-  try { data = await res.json(); } catch { /* body rỗng hoặc không phải JSON */ }
+  try { data = await res.json(); } catch { /* empty body or not JSON */ }
   if (!res.ok) throw new Error((data && data.error) || `Lỗi HTTP ${res.status} từ ${url}`);
   return data;
 }
 
-/* ===== Khung chat — render bubble ===== */
+/* ===== Chat pane: render bubbles ===== */
 function scrollToBottom() {
   const box = $('chat-messages');
   box.scrollTop = box.scrollHeight;
 }
 
-/* appendMessage: thêm 1 bubble vào vùng chat.
-   role: 'user' | 'assistant'. memories: mảng facts bot vừa dùng (nếu có). */
+/* appendMessage: add one bubble to the chat area.
+   role: 'user' | 'assistant'. memories: array of facts the bot just used (if any). */
 function appendMessage(role, text, memories) {
   const wrap = document.createElement('div');
   wrap.className = role === 'user' ? 'msg msg-user' : 'msg msg-bot';
@@ -135,7 +135,7 @@ function appendMessage(role, text, memories) {
   bubble.innerHTML = renderMarkdown(text);
   wrap.appendChild(bubble);
 
-  // Callout "✨ Bot nhớ: ..." ngay dưới bubble của bot khi có memories_used
+  // "✨ Bot nhớ: ..." (the bot remembers) callout right under the bot bubble when memories_used is set
   if (role !== 'user' && Array.isArray(memories) && memories.length > 0) {
     const note = document.createElement('div');
     note.className = 'memory-callout';
@@ -147,11 +147,11 @@ function appendMessage(role, text, memories) {
   scrollToBottom();
 }
 
-/* Chỉ báo "bot đang gõ..." với 3 chấm nhấp nháy + đồng hồ đếm giây trôi */
+/* "Bot is typing..." indicator: 3 blinking dots + a running seconds counter */
 function showTyping() {
   const el = document.createElement('div');
   el.className = 'msg msg-bot typing-msg';
-  el.id = 'typing-bubble'; // ID động — phần tử này tự tạo rồi tự tra cứu lại
+  el.id = 'typing-bubble'; // dynamic ID: this element creates itself and looks itself up again
   el.innerHTML = `
     <div class="bubble typing">
       <span class="typing-dots"><i></i><i></i><i></i></span>
@@ -175,9 +175,9 @@ function hideTyping() {
   if (el) el.remove();
 }
 
-/* ===== Tải dữ liệu từ backend ===== */
+/* ===== Load data from the backend ===== */
 
-/* loadAgentInfo: GET /api/info → dot trạng thái + dòng thông tin ở sidebar */
+/* loadAgentInfo: GET /api/info -> status dot + info line in the sidebar */
 async function loadAgentInfo() {
   try {
     const info = await fetchJson(API.INFO);
@@ -195,13 +195,13 @@ async function loadAgentInfo() {
   }
 }
 
-/* loadActors: GET /api/actors → danh sách khách; tự chọn khách đầu tiên lần đầu mở */
+/* loadActors: GET /api/actors -> guest list; selects the first guest the first time the page opens */
 async function loadActors() {
   try {
     const data = await fetchJson(API.ACTORS);
     state.actors = (data && data.actors) || [];
     renderActorList();
-    // Lần đầu mở trang (chưa chọn ai) → chọn khách đầu tiên để có sẵn hội thoại
+    // First page load (nobody selected yet) -> pick the first guest so a conversation is ready
     if (!state.currentActor && state.actors.length > 0) {
       const first = state.actors[0];
       selectActor(first.actorId, (first.sessions || [])[0] || null);
@@ -211,7 +211,7 @@ async function loadActors() {
   }
 }
 
-/* renderActorList: vẽ danh sách khách hàng ở cột trái */
+/* renderActorList: draw the guest list in the left column */
 function renderActorList() {
   const list = $('actor-list');
   list.innerHTML = '';
@@ -235,24 +235,24 @@ function renderActorList() {
         <span class="actor-id">${escapeHtml(actor.actorId)}</span>
         <span class="actor-sub">${sessions.length} session</span>
       </span>`;
-    // Chọn khách: dùng session có sẵn nếu có, không thì tạo session mới
+    // Select the guest: reuse an existing session if there is one, else start a new one
     item.addEventListener('click', () => selectActor(actor.actorId, sessions[0] || null));
     list.appendChild(item);
   }
 }
 
-/* avatarLabel: với id kiểu số điện thoại, lấy 2 chữ số cuối làm "chữ cái đầu" trên avatar */
+/* avatarLabel: for a phone-number-like id, use the last 2 digits as the avatar "initials" */
 function avatarLabel(actorId) {
   const str = String(actorId || '');
   return str.slice(-2) || '?';
 }
 
-/* newSessionId: session mới cho khách giả lập (backend tự ghi nhận ở tin nhắn đầu) */
+/* newSessionId: a fresh session for a simulated guest (the backend records it at the first message) */
 function newSessionId() {
   return `web-${Date.now()}`;
 }
 
-/* selectActor: đổi khách hàng đang chat → tải lại lịch sử + hồ sơ memory */
+/* selectActor: switch the active guest -> reload history + memory profile */
 function selectActor(actorId, sessionId) {
   state.currentActor = actorId;
   state.currentSession = sessionId || newSessionId();
@@ -262,7 +262,7 @@ function selectActor(actorId, sessionId) {
   loadMemory();
 }
 
-/* loadHistory: GET /api/history?actor=&session= → vẽ lại toàn bộ bubble (tăng dần) */
+/* loadHistory: GET /api/history?actor=&session= -> redraw every bubble (oldest first) */
 async function loadHistory() {
   const box = $('chat-messages');
   box.innerHTML = '<p class="history-loading">Đang tải lịch sử hội thoại…</p>';
@@ -274,7 +274,7 @@ async function loadHistory() {
 
     box.innerHTML = '';
     if (!events.length) {
-      // Chưa có tin nhắn nào → hiện khối chào mừng thân thiện
+      // No message yet -> show a friendly welcome block
       box.innerHTML = `
         <div class="welcome">
           <p>👋 Xin chào <strong>${escapeHtml(state.currentActor)}</strong>!</p>
@@ -292,7 +292,7 @@ async function loadHistory() {
   }
 }
 
-/* loadMemory: GET /api/memory?actor= → nhóm theo memory strategy, card cho từng record */
+/* loadMemory: GET /api/memory?actor= -> grouped by memory strategy, one card per record */
 async function loadMemory() {
   if (!state.currentActor) return;
   try {
@@ -339,7 +339,7 @@ function renderMemory(groups) {
   }
 }
 
-/* loadBookings: GET /api/bookings → bảng đặt bàn ở cột phải */
+/* loadBookings: GET /api/bookings -> bookings table in the right column */
 async function loadBookings() {
   try {
     const data = await fetchJson(API.BOOKINGS);
@@ -372,7 +372,7 @@ function renderBookings(bookings) {
   }
 }
 
-/* ===== Gửi tin nhắn: POST /invocations với header User-Id / Session-Id ===== */
+/* ===== Send a message: POST /invocations with the User-Id / Session-Id headers ===== */
 async function submitMessage() {
   const input = $('composer-input');
   const text = input.value.trim();
@@ -382,7 +382,7 @@ async function submitMessage() {
     showToast('Hãy chọn hoặc thêm một khách hàng trước khi nhắn tin.');
     return;
   }
-  if (state.sending) return; // đang chờ phản hồi trước đó
+  if (state.sending) return; // still waiting for the previous answer
 
   state.sending = true;
   $('send-btn').disabled = true;
@@ -397,7 +397,7 @@ async function submitMessage() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        // Đúng hợp đồng backend: định danh khách (Zalo user id) và phiên chat
+        // Exactly the backend contract: the guest identity (Zalo user id) and the chat session
         'X-GreenNode-AgentBase-User-Id': state.currentActor,
         'X-GreenNode-AgentBase-Session-Id': state.currentSession,
       },
@@ -411,8 +411,8 @@ async function submitMessage() {
     hideTyping();
     appendMessage('assistant', data.response || '(Bot trả về nội dung rỗng)', data.memories_used);
 
-    // Tự làm mới sau mỗi lượt bot trả lời: memory có thể vừa được trích xuất,
-    // đặt bàn có thể vừa được tạo, session mới có thể xuất hiện
+    // Refresh after every bot answer: memory may have just been extracted, a booking may have
+    // just been created, a new session may have appeared
     loadMemory();
     loadBookings();
     loadActors();
@@ -427,12 +427,12 @@ async function submitMessage() {
   }
 }
 
-/* ===== Thêm khách giả lập mới ===== */
+/* ===== Add a new simulated guest ===== */
 
-/* normalizeActorId: chuẩn hoá số điện thoại thành actorId.
-   - Bỏ mọi ký tự không phải chữ số (kể cả dấu +).
-   - Số nội địa bắt đầu bằng 0 (VD 0901234567) → tự thay 0 bằng 84 → 84901234567.
-   - Đã ở dạng quốc tế (84901…) hoặc dạng khác → giữ nguyên bản. */
+/* normalizeActorId: normalise a phone number into an actorId.
+   - Drop every non-digit character (including +).
+   - A domestic number starting with 0 (e.g. 0901234567) gets the 0 replaced by 84 -> 84901234567.
+   - Already international (84901…) or any other form -> kept as is. */
 function normalizeActorId(raw) {
   const digits = String(raw || '').replace(/\D/g, '');
   if (!digits) return null;
@@ -450,7 +450,7 @@ function submitNewCustomer(event) {
     return;
   }
 
-  // Khách đã có trong danh sách → chỉ chọn lại, không thêm trùng
+  // Guest already in the list -> just select again, do not add a duplicate
   const existing = state.actors.find((a) => a.actorId === actorId);
   if (existing) {
     selectActor(actorId, (existing.sessions || [])[0] || null);
@@ -458,13 +458,13 @@ function submitNewCustomer(event) {
     return;
   }
 
-  // Thêm tạm vào danh sách local (backend sẽ tự biết actor này sau tin nhắn đầu tiên)
+  // Add to the local list for now (the backend learns about this actor after the first message)
   state.actors.unshift({ actorId, sessions: [] });
   input.value = '';
-  selectActor(actorId, null); // khách mới → session hoàn toàn mới
+  selectActor(actorId, null); // new guest -> a completely new session
 }
 
-/* ===== Gắn sự kiện & khởi động ===== */
+/* ===== Wire up events & start ===== */
 function autoResizeTextarea() {
   const ta = $('composer-input');
   ta.style.height = 'auto';
@@ -472,7 +472,7 @@ function autoResizeTextarea() {
 }
 
 function bindEvents() {
-  // Gửi tin nhắn: submit form hoặc phím Enter (Shift+Enter vẫn xuống dòng)
+  // Send a message: form submit or the Enter key (Shift+Enter still inserts a line break)
   $('composer').addEventListener('submit', (e) => { e.preventDefault(); submitMessage(); });
   $('composer-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -482,7 +482,7 @@ function bindEvents() {
   });
   $('composer-input').addEventListener('input', autoResizeTextarea);
 
-  // Chip gợi ý: chỉ điền nội dung vào ô soạn tin, người dùng tự bấm Gửi
+  // Suggestion chips: only fill the composer, the user presses Send themselves
   document.querySelectorAll('#suggestion-chips .chip').forEach((chip) => {
     chip.addEventListener('click', () => {
       const input = $('composer-input');
@@ -492,13 +492,13 @@ function bindEvents() {
     });
   });
 
-  // Form thêm khách giả lập mới + nút làm mới bảng đặt bàn + nút tắt toast
+  // New simulated guest form + bookings refresh button + toast close button
   $('new-customer-form').addEventListener('submit', submitNewCustomer);
   $('bookings-refresh').addEventListener('click', loadBookings);
   $('toast-close').addEventListener('click', hideToast);
 }
 
-/* init: nạp song song thông tin agent, danh sách khách, bảng đặt bàn */
+/* init: load agent info, guest list and bookings table in parallel */
 async function init() {
   bindEvents();
   await Promise.allSettled([loadAgentInfo(), loadActors(), loadBookings()]);

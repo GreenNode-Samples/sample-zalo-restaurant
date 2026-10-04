@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Zalo Restaurant Bot — Web Simulator | Quán Ngon 123</title>
   <!--
-    Web Simulator cho sample repo "Zalo Restaurant Bot — bot quán ăn nhớ khách quen".
-    Trang tĩnh (không build step, không CDN, không framework) được backend Python SDK
-    serve tại GET /. Toàn bộ API gọi same-origin nên không gặp vấn đề CORS.
+    Web Simulator for the sample repo "Zalo Restaurant Bot — a restaurant bot that remembers its guests".
+    A static page (no build step, no CDN, no framework) served by the Python SDK backend
+    at GET /. Every API call is same-origin, so CORS is not an issue.
   -->
   <meta property="og:title" content="Zalo Restaurant Bot — Web Simulator (Quán Ngon 123)">
   <meta property="og:description" content="Bot quán ăn nhớ khách quen: CUSTOM Memory + custom MCP server (runtime riêng) + Zalo Bot Platform webhook — chạy trên GreenNode AgentBase.">
@@ -17,13 +17,13 @@
 </head>
 <body>
 
-  <!-- Dải toast lỗi trên cùng: hiện khi một lệnh fetch thất bại, có nút tắt -->
+  <!-- Error toast strip on top: shown when a fetch fails, with a close button -->
   <div id="toast-strip" class="toast-strip hidden" role="alert">
     <span id="toast-message"></span>
     <button id="toast-close" class="toast-close" type="button" title="Đóng thông báo">✕</button>
   </div>
 
-  <!-- Thanh tiêu đề ứng dụng -->
+  <!-- App title bar -->
   <header class="app-header">
     <div class="app-header-left">
       <span class="app-logo" aria-hidden="true">🍜</span>
@@ -35,18 +35,18 @@
     <span class="app-header-badge">no build · no CDN · vanilla JS</span>
   </header>
 
-  <!-- Bố cục 3 cột: khách hàng | khung chat điện thoại | bộ nhớ & đặt bàn -->
+  <!-- 3-column layout: guests | phone chat | memory & bookings -->
   <main class="layout">
 
-    <!-- ================= CỘT TRÁI: Danh sách khách hàng (Zalo users) ================= -->
+    <!-- ================= LEFT COLUMN: guest list (Zalo users) ================= -->
     <aside class="sidebar">
       <section class="panel">
         <h2 class="panel-title">👥 Khách hàng <small>(Zalo users)</small></h2>
 
-        <!-- Danh sách actor lấy từ GET /api/actors, render bằng app.js -->
+        <!-- Actor list from GET /api/actors, rendered by app.js -->
         <div id="actor-list" class="actor-list"></div>
 
-        <!-- Form giả lập khách mới: id là số điện thoại, tự thêm đầu 84 nếu nhập số nội địa -->
+        <!-- Form for a new simulated guest: the id is a phone number, 84 is prefixed for a domestic number -->
         <form id="new-customer-form" class="new-customer" autocomplete="off">
           <input
             id="new-customer-input"
@@ -62,16 +62,16 @@
           💡 actorId = Zalo user ID thật khi chạy qua webhook Zalo.
         </p>
 
-        <!-- Thông tin agent từ GET /api/info (model, trạng thái cấu hình Zalo OA) -->
+        <!-- Agent info from GET /api/info (model, Zalo OA configuration status) -->
         <p id="info-line" class="info-line">Đang tải thông tin agent…</p>
       </section>
     </aside>
 
-    <!-- ================= CỘT GIỮA: Khung chat giả lập điện thoại Zalo ================= -->
+    <!-- ================= MIDDLE COLUMN: simulated Zalo phone chat ================= -->
     <section class="phone-column">
       <div class="phone-frame">
 
-        <!-- Header của khung chat: tên quán + badge + dot trạng thái -->
+        <!-- Chat frame header: restaurant name + badge + status dot -->
         <div class="phone-header">
           <div class="oa-avatar" aria-hidden="true">🍜</div>
           <div class="phone-header-text">
@@ -84,10 +84,10 @@
           <span class="badge-zalo">Zalo Simulator</span>
         </div>
 
-        <!-- Vùng hiển thị tin nhắn (lịch sử + tin nhắn mới) -->
+        <!-- Message area (history + new messages) -->
         <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
 
-        <!-- Chip gợi ý nhanh: click sẽ điền nội dung vào ô soạn tin (không tự gửi) -->
+        <!-- Quick suggestion chips: a click fills the composer (it does not send) -->
         <div id="suggestion-chips" class="suggestion-chips" role="group" aria-label="Gợi ý nhanh">
           <button type="button" class="chip">Đặt bàn tối nay 4 người</button>
           <button type="button" class="chip">Tôi muốn bàn yên tĩnh</button>
@@ -95,7 +95,7 @@
           <button type="button" class="chip">Nhớ: sinh nhật tôi tháng 12</button>
         </div>
 
-        <!-- Ô soạn tin: Enter = gửi, Shift+Enter = xuống dòng -->
+        <!-- Composer: Enter = send, Shift+Enter = line break -->
         <form id="composer" class="composer" autocomplete="off">
           <textarea
             id="composer-input"
@@ -109,10 +109,10 @@
       <p class="phone-hint">Enter để gửi · Shift + Enter để xuống dòng</p>
     </section>
 
-    <!-- ================= CỘT PHẢI: Bộ nhớ khách + Đặt bàn ================= -->
+    <!-- ================= RIGHT COLUMN: guest memory + bookings ================= -->
     <aside class="right-panel">
 
-      <!-- Hồ sơ khách (Memory) — tự làm mới sau mỗi lượt bot trả lời và khi đổi khách -->
+      <!-- Guest profile (Memory): refreshed after every bot answer and when the guest changes -->
       <section class="panel">
         <h2 class="panel-title">🧠 Hồ sơ khách <small>(Memory)</small></h2>
         <div id="memory-panel" class="memory-panel"></div>
@@ -121,7 +121,7 @@
         </p>
       </section>
 
-      <!-- Đặt bàn hiện có — tải khi mở trang, có nút làm mới, cũng tự làm mới sau mỗi lượt bot trả lời -->
+      <!-- Current bookings: loaded when the page opens, has a refresh button, also refreshed after every bot answer -->
       <section class="panel">
         <div class="panel-head">
           <h2 class="panel-title">📋 Đặt bàn hiện có</h2>
