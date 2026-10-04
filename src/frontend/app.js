@@ -9,11 +9,15 @@
  *
  * API contract (same origin):
  *   POST /invocations        send a message to the agent
- *   GET  /api/info           agent info (model, memory, zalo_configured…)
+ *   GET  /api/info           agent info (model, memory, zalo_configured…); open, but only
+ *                            {agent, auth_required} without the API key
  *   GET  /api/memory?actor=  guest profile from the memory strategy
  *   GET  /api/history?actor=&session=  conversation history (oldest first)
  *   GET  /api/actors         guests and their sessions
- *   GET  /api/bookings       current bookings
+ *   GET  /api/bookings?actor=  the guest's upcoming bookings
+ *
+ * When the backend sets AGENT_API_KEY (/api/info says auth_required) the page asks for the key
+ * once, keeps it in sessionStorage and sends it as X-API-Key on every request.
  * ========================================================================= */
 'use strict';
 
@@ -38,6 +42,7 @@ const state = {
   sending: false,       // blocks a second send while the bot is answering
   timerId: null,        // interval counting the wait for the bot's answer
   pendingStart: 0,      // when the wait started
+  apiKey: '',           // API key typed by the user (also mirrored to sessionStorage)
 };
 
 /* ----- Short DOM helper ----- */
@@ -93,13 +98,24 @@ function hideToast() {
   clearTimeout(toastTimer);
 }
 
-/* API key (when the backend sets AGENT_API_KEY): kept in localStorage, attached to every request */
+/* API key (when the backend sets AGENT_API_KEY): asked once, kept in sessionStorage (so it
+   disappears with the tab) and attached to every request as X-API-Key */
 const KEY_STORAGE = 'zalo_bot_api_key';
+
+function loadStoredApiKey() {
+  try { return sessionStorage.getItem(KEY_STORAGE) || ''; } catch (e) { return ''; /* storage blocked */ }
+}
+
+function saveApiKey(key) {
+  state.apiKey = key;
+  try {
+    if (key) sessionStorage.setItem(KEY_STORAGE, key); else sessionStorage.removeItem(KEY_STORAGE);
+  } catch (e) { /* storage blocked: the key then lives in memory until the page is closed */ }
+}
+
 function authHeaders(extra = {}) {
   const h = Object.assign({}, extra);
-  let k = '';
-  try { k = localStorage.getItem(KEY_STORAGE) || ''; } catch (e) { /* private mode */ }
-  if (k) h['X-API-Key'] = k;
+  if (state.apiKey) h['X-API-Key'] = state.apiKey;
   return h;
 }
 
@@ -114,6 +130,10 @@ async function fetchJson(url, options = {}) {
   }
   let data = null;
   try { data = await res.json(); } catch { /* empty body or not JSON */ }
+  if (res.status === 401) {
+    saveApiKey(''); // a rejected key is forgotten: reloading the page asks for a new one
+    throw new Error('API key không đúng hoặc đã đổi — tải lại trang để nhập lại.');
+  }
   if (!res.ok) throw new Error((data && data.error) || `Lỗi HTTP ${res.status} từ ${url}`);
   return data;
 }
@@ -177,10 +197,30 @@ function hideTyping() {
 
 /* ===== Load data from the backend ===== */
 
-/* loadAgentInfo: GET /api/info -> status dot + info line in the sidebar */
+/* askForApiKey: ask the user for the API key once (window.prompt); returns true when one was given */
+function askForApiKey() {
+  const key = window.prompt('Server này yêu cầu API key (biến AGENT_API_KEY). Nhập key để tiếp tục:');
+  if (!key || !key.trim()) return false;
+  saveApiKey(key.trim());
+  return true;
+}
+
+/* loadAgentInfo: GET /api/info -> status dot + info line in the sidebar.
+   /api/info is open and tells whether a key is needed; with a wrong or missing key it returns only
+   {agent, auth_required}. Resolves to false when the API stays locked (no usable key). */
 async function loadAgentInfo() {
   try {
-    const info = await fetchJson(API.INFO);
+    let info = await fetchJson(API.INFO);
+    if (info && info.auth_required && !state.apiKey && askForApiKey()) {
+      info = await fetchJson(API.INFO);
+    }
+    if (info && info.auth_required && info.llm_model === undefined) {
+      saveApiKey('');
+      $('agent-status').textContent = 'Cần API key — tải lại trang để nhập';
+      $('status-dot').className = 'status-dot warn';
+      $('info-line').textContent = 'API bị khóa: chưa có API key hợp lệ.';
+      return false;
+    }
     const configured = info && info.zalo_configured === true;
     $('agent-status').textContent = configured
       ? 'Đang hoạt động'
@@ -190,8 +230,10 @@ async function loadAgentInfo() {
       `🤖 <strong>${escapeHtml(info.agent || 'agent')}</strong>` +
       ` · model <code>${escapeHtml(info.llm_model || '—')}</code>` +
       `<br>memory: <code>${escapeHtml(info.memory_id || '—')}</code>`;
+    return true;
   } catch (err) {
     showToast(err.message);
+    return false;
   }
 }
 
@@ -260,6 +302,7 @@ function selectActor(actorId, sessionId) {
   $('chat-messages').innerHTML = '';
   loadHistory();
   loadMemory();
+  loadBookings();
 }
 
 /* loadHistory: GET /api/history?actor=&session= -> redraw every bubble (oldest first) */
@@ -339,17 +382,22 @@ function renderMemory(groups) {
   }
 }
 
-/* loadBookings: GET /api/bookings -> bookings table in the right column */
+/* loadBookings: GET /api/bookings?actor= -> the selected guest's upcoming bookings (right column) */
 async function loadBookings() {
+  if (!state.currentActor) {
+    renderBookings([]);
+    return;
+  }
   try {
-    const data = await fetchJson(API.BOOKINGS);
-    renderBookings((data && data.bookings) || []);
+    const data = await fetchJson(`${API.BOOKINGS}?actor=${encodeURIComponent(state.currentActor)}`);
+    if (data && data.error) showToast(data.error);
+    renderBookings((data && data.bookings) || [], Boolean(data && data.truncated));
   } catch (err) {
     showToast(err.message);
   }
 }
 
-function renderBookings(bookings) {
+function renderBookings(bookings, truncated = false) {
   const tbody = $('bookings-table-body');
   tbody.innerHTML = '';
 
@@ -369,6 +417,10 @@ function renderBookings(bookings) {
       <td>${escapeHtml(booking.table || '—')}</td>
       <td><span class="status-badge ${statusClass}">${escapeHtml(booking.status || '?')}</span></td>`;
     tbody.appendChild(tr);
+  }
+  if (truncated) {
+    tbody.insertAdjacentHTML('beforeend',
+      '<tr><td colspan="6" class="empty-note">Chỉ hiển thị 20 lượt đặt bàn gần nhất.</td></tr>');
   }
 }
 
@@ -498,10 +550,13 @@ function bindEvents() {
   $('toast-close').addEventListener('click', hideToast);
 }
 
-/* init: load agent info, guest list and bookings table in parallel */
+/* init: read the agent info first (it may ask for the API key), then load the guest list;
+   selecting a guest loads their history, memory profile and bookings */
 async function init() {
   bindEvents();
-  await Promise.allSettled([loadAgentInfo(), loadActors(), loadBookings()]);
+  state.apiKey = loadStoredApiKey();
+  renderBookings([]);
+  if (await loadAgentInfo()) await loadActors();
 }
 
 document.addEventListener('DOMContentLoaded', init);

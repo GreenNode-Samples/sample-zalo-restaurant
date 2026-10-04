@@ -151,7 +151,7 @@ if [[ -n "$RUNTIME_URL" ]]; then
     if [[ -n "$bot" ]]; then
       pass "[agent] /ready: Zalo getMe ok (bot '${bot}'): outbound egress to bot-api.zaloplatforms.com works"
     else
-      note "[agent] /ready: zalo.bot is empty: ZALO_BOT_TOKEN is not set, or getMe failed (no outbound egress? verify with GreenNode). The result is cached: restart the runtime after fixing"
+      note "[agent] /ready: zalo.bot is empty: ZALO_BOT_TOKEN is not set, or getMe failed (no outbound egress? verify with GreenNode). A failure is cached for 30 seconds: run the check again after fixing"
     fi
   elif [[ "$code" == "000" || -z "$code" ]]; then
     fail "[agent] GET /health -> no response" \
@@ -189,7 +189,7 @@ if [[ -n "$PROXY_URL" ]]; then
     case "$code" in
       403) pass "[proxy] POST /webhook/zalo without the secret -> 403 (forwarded, rejected by the agent)" ;;
       404) fail "[proxy] POST /webhook/zalo -> 404" "the route is not forwarded: check the Caddyfile / load balancer path rule" ;;
-      502|503|504) fail "[proxy] POST /webhook/zalo -> ${code}" "the proxy cannot reach the runtime private endpoint: check RUNTIME_UPSTREAM, routes and security groups" ;;
+      502|503|504) fail "[proxy] POST /webhook/zalo -> ${code}" "the proxy cannot reach the runtime private endpoint (check RUNTIME_UPSTREAM, routes and security groups), or the runtime answered 503 because ZALO_BOT_TOKEN / ZALO_WEBHOOK_SECRET is not set" ;;
       429) fail "[proxy] POST /webhook/zalo -> 429" "rate limit hit: wait a minute and retry" ;;
       2*)  fail "[proxy] POST /webhook/zalo without the secret -> ${code}" "the agent accepted an unsigned request: set ZALO_WEBHOOK_SECRET on the runtime" ;;
       *)   fail "[proxy] POST /webhook/zalo -> ${code:-no response}" "unexpected status" ;;

@@ -80,10 +80,12 @@ The API reference in the documentation reviewed for this sample does not list th
 | `LANGFUSE_PUBLIC_KEY` | yes (for traces) | `pk-lf-...` | low |
 | `LANGFUSE_SECRET_KEY` | yes (for traces) | `sk-lf-...` | **yes** |
 | `ZALO_BOT_TOKEN` | for real Zalo | `<id>:<secret>` from Zalo Bot Creator | **yes** |
-| `ZALO_WEBHOOK_SECRET` | recommended | 8 to 256 characters you choose; same value as in `setWebhook` | **yes** |
+| `ZALO_WEBHOOK_SECRET` | **yes**, with `ZALO_BOT_TOKEN` | 8 to 256 characters you choose; same value as in `setWebhook`. Without it the webhook answers `503` | **yes** |
+| `ZALO_MAX_WORKERS` | optional | Zalo chats processed at the same time, default `8` | no |
 | `ZALO_API_BASE` | default | `https://bot-api.zaloplatforms.com` | no |
 | `SERVE_UI` | set `false` | disables the web simulator on the endpoint (Zalo-first) | no |
-| `AGENT_API_KEY` | recommended | protects `/invocations` and `/api/*` with `X-API-Key` | **yes** |
+| `AGENT_API_KEY` | recommended | protects `/invocations`, `/a2a` and `/api/*` with `X-API-Key` | **yes** |
+| `A2A_PUBLIC_URL` | optional | public base URL of the runtime for the A2A agent card | no |
 | `DEBUG_OPS` | keep `0` | `1` only while reading the principal for the gateway policy | no |
 
 Notes:
@@ -123,7 +125,7 @@ URL exists, IP Access Control is what keeps the Internet away from it, and the w
 
 ## 5. Outbound (egress)
 
-The webhook proxy only carries traffic **in**. The reply goes **out** from the runtime: after the fast `200` ack, a background thread calls Zalo directly
+The webhook proxy only carries traffic **in**. The reply goes **out** from the runtime: after the fast `200` ack, a worker thread calls Zalo directly
 (`Agent Runtime --HTTPS sendMessage--> Zalo Bot Platform`). The runtime must therefore reach these destinations on **TCP 443**:
 
 | Destination | Used for | Path |
@@ -135,7 +137,7 @@ The webhook proxy only carries traffic **in**. The reply goes **out** from the r
 | Langfuse `http://<langfuse-private-ip>:3000` | traces | private network (Route CIDRs) |
 
 **Verify with GreenNode: Private runtime outbound Internet egress.** The documentation says a Private runtime is not exposed to the public internet (inbound) and that Route CIDRs reach
-customer subnets; it does not say whether the runtime keeps outbound Internet access. Check it first: `GET /ready` (section 6) shows `zalo.bot` only when `getMe` succeeded, and a failed reply is
+customer subnets; it does not say whether the runtime keeps outbound Internet access. Check it first: `GET /ready` (section 6) shows `checks.zalo.bot` only when `getMe` succeeded, and a failed reply is
 logged as `sent=False` with a `ConnectError`.
 
 **Fallback if there is no egress (documented only, not implemented in this repository).** Run a forward proxy (for example tinyproxy or squid) on a vServer in the public subnet. Accept connections
@@ -161,8 +163,7 @@ Not tested through a real proxy on a runtime, and whether the runtime accepts th
    curl -s http://<private-endpoint>/ready                              # memory, gateway path and Zalo getMe (egress)
    ```
 
-   `/ready` returns `200` when Memory and the gateway tools respond and `LLM_API_KEY` is set; `zalo.bot` is the bot name when the `getMe` call to Zalo worked (egress). The bot name is cached for the life of the process, including a failed
-   lookup, so restart the runtime after fixing egress.
+   `/ready` returns `200` when Memory and the gateway tools respond and `LLM_API_KEY` is set; `checks.zalo.bot` is the bot name when the `getMe` call to Zalo worked (egress); it never changes the `200` / `503` status. The result is cached for 5 minutes on success and 30 seconds on failure, so after fixing egress it recovers on its own within half a minute. The `getMe` call is not made at all when `ZALO_BOT_TOKEN` is unset.
 3. Register the webhook through the proxy ([`../webhook-proxy`](../webhook-proxy/README.md)), then message the bot in Zalo.
 4. The reply arrives, a booking appears in `list_bookings`, and a **trace** appears in Langfuse (opened over the VPN).
 5. Gateway policy: the runtime's principal must be allowed to call the seven `restaurant__*` actions (set `DEBUG_OPS=1`

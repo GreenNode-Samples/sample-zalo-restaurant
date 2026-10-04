@@ -16,7 +16,7 @@ The proxy carries only **inbound** events. The reply to the guest is sent by the
 (see [Outbound (egress)](../agent/README.md#5-outbound-egress)): it does not go back through this proxy.
 
 The proxy is a narrow door, not the authentication. The agent still verifies Zalo's secret header on every event
-(`403` on a wrong secret). Keep `ZALO_WEBHOOK_SECRET` set.
+(`403` on a wrong secret). `ZALO_WEBHOOK_SECRET` is mandatory on the runtime: without it the agent answers `503` instead of accepting unsigned events.
 
 | File | Purpose |
 |---|---|

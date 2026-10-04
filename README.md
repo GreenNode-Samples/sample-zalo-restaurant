@@ -42,7 +42,7 @@ The sample was first demonstrated on a demo account with every component on Agen
 | Returns later **via Zalo** (new session): "I'll come back this weekend" | *"Hi Hung! You sat at table T3 last time — the kitchen always cooks non-spicy for you"* — guest profile from the **CUSTOM memory strategy** |
 | Unknown caller hits `/webhook/zalo` without the secret | **403 Denied** (`X-Bot-Api-Secret-Token` header) |
 
-The **Web Simulator** (`GET /`): a Zalo-style UI (phone frame), add new guests, chat, plus a **Guest profile** panel and a **Current bookings** table (read live from the MCP server).
+The **Web Simulator** (`GET /`): a Zalo-style UI (phone frame), add new guests, chat, plus a **Guest profile** panel and an **Upcoming bookings** table for the selected guest (read live from the MCP server with that guest's id). With `AGENT_API_KEY` set the page asks for the key once (`/api/info` reports `auth_required`), keeps it in `sessionStorage` and sends it as `X-API-Key`.
 
 ## Architecture
 
@@ -51,7 +51,7 @@ The request path for a guest message and the tool-call path:
 ```
 Guest (Zalo app)
   -> Zalo Bot Platform  --HTTPS-->  webhook proxy (public subnet): only POST /webhook/zalo, TLS, size + rate limit
-  -> Agent Runtime (AgentBase, Private mode)  ack 200 at once, LLM turn in a background thread
+  -> Agent Runtime (AgentBase, Private mode)  ack 200 at once, LLM turn on a bounded worker pool
         |-- Memory (AgentBase)          guest profile, CUSTOM strategy "customer-profile"
         |-- LLM (GreenNode AIP)         direct, or the Sidecar LLM Proxy
         |-- Langfuse (customer VPC)     traces over the private network: http://<langfuse-private-ip>:3000
@@ -64,7 +64,7 @@ Reply path (outbound from the runtime, not through the proxy):
 Admin laptop -> client-to-site VPN (pfSense OpenVPN) -> Langfuse UI on a private IP
 ```
 
-The webhook proxy is **inbound only**. After the fast `200` ack, a background thread in the runtime calls `https://bot-api.zaloplatforms.com` (`ZALO_API_BASE`) directly to send the reply
+The webhook proxy is **inbound only**. After the fast `200` ack, a worker thread in the runtime calls `https://bot-api.zaloplatforms.com` (`ZALO_API_BASE`) directly to send the reply
 (`sendMessage`; `getMe` for the bot name). The default LLM endpoint (`maas-llm-aiplatform-hcm.api.vngcloud.vn`) and the AgentBase Memory and IAM APIs are public hostnames as well, so a
 Private-mode runtime needs **outbound Internet egress** for them too (the Sidecar LLM Proxy may cover the LLM path: verify). The documentation does not say whether a
 Private runtime has egress: see [Verify with GreenNode](#verify-with-greennode) and the fallback in [`deploy/agent`](deploy/agent/README.md#5-outbound-egress).
@@ -110,11 +110,12 @@ needs the **AgentBase private connection** (VPC peering) to be activated for you
   - **Errors and output**: tools return JSON objects (MCP structured output); failures are MCP tool errors (`isError: true`) whose message says how to fix the call.
     `list_bookings` returns only upcoming bookings, at most 20, with a `truncated` flag.
   - A `restaurant.db` created by the earlier version of this sample (bookings keyed by name) is refused at startup: back it up and delete it.
-- **`src/backend`**: LangGraph agent + Memory (1 **CUSTOM** strategy "customer-profile") + the Zalo webhook (**ack 200 immediately, LLM turn runs in a
-  background thread**: Zalo never waits on the LLM; secret verification, retry dedupe, replies with `parse_mode=markdown` cut cleanly at the 2000-char limit).
+- **`src/backend`**: LangGraph agent + Memory (1 **CUSTOM** strategy "customer-profile") + the Zalo webhook (**ack 200 immediately, the LLM turn runs on a
+  bounded worker pool**: Zalo never waits on the LLM; the secret is required and checked first, retries are deduplicated, a guest's messages are answered in order,
+  and replies with `parse_mode=markdown` longer than the 2,000-character Zalo limit are split into several messages).
   This is the **only** image deployed to AgentBase.
 - **Webhook proxy**: because the runtime is Private, a small public reverse proxy in the VPC forwards only `POST /webhook/zalo` to the runtime's private endpoint.
-  The app still verifies Zalo's `X-Bot-Api-Secret-Token`.
+  The app still verifies Zalo's `X-Bot-Api-Secret-Token` (and refuses the webhook with `503` when `ZALO_BOT_TOKEN` is set without `ZALO_WEBHOOK_SECRET`).
 - **Policy Group** `zalo-gw-policy` (first match wins): the agent principal may call only the 7 `restaurant__*` actions; a `tools/call` matching no rule gets
   **403**. With **no** Policy Group attached, *every* `tools/call` is 403; `tools/list` bypasses policy.
 - **Connector `restaurant`**: **Outbound Auth = API Key** (2LO, one shared key), header key `X-Api-Key`, **empty header value prefix**, secret provider
@@ -195,8 +196,8 @@ named `customer-profile`.
    PROXY_URL=https://<webhook-domain> ./deploy/check_connectivity.sh
    ```
 
-   With `RUNTIME_URL` the script also calls the runtime's `GET /ready`, which checks Memory, the gateway path and the Zalo `getMe` call (a proof of outbound egress). Then message the bot in Zalo: a reply arrives, a booking is created, a trace appears in Langfuse. Zalo notes: only `event_name = message.text.received` is handled;
-   image, sticker and voice events are safely ignored; `getWebhookInfo` re-checks the configuration and `testWebhook` tests it.
+   With `RUNTIME_URL` the script also calls the runtime's `GET /ready`, which checks Memory, the gateway path and the Zalo `getMe` call (a proof of outbound egress). Then message the bot in Zalo: a reply arrives, a booking is created, a trace appears in Langfuse. Zalo notes: only `event_name = message.text.received` with a non-empty text is handled;
+   image, sticker, voice and empty-text events are ignored with a log line (the webhook still answers `200`); `getWebhookInfo` re-checks the configuration and `testWebhook` tests it.
 
 ## Security checklist
 
@@ -222,9 +223,10 @@ named `customer-profile`.
 | `401` from the gateway endpoint | Inbound IAM auth failed (the agent's token) | Runtime identity and `GREENNODE_CLIENT_*`; `MCP_RESTAURANT_URL` must be the gateway URL plus `/restaurant` |
 | `404` or `Session terminated` from MCP | Wrong path | Gateway URL must end with the connector name; the connector URL must end with `/mcp` |
 | Webhook returns `404` | Wrong URL or method; the proxy exposes only `POST /webhook/zalo` | The registered URL ends with `/webhook/zalo`; `check_connectivity.sh` with `PROXY_URL` |
-| Webhook accepted (`200`) but the guest never gets a reply; runtime log shows `sent=False` (`ConnectError` or timeout) | The Private runtime cannot reach `bot-api.zaloplatforms.com` (no outbound egress) | `GET /ready` (`zalo.bot` empty); [`deploy/agent`](deploy/agent/README.md#5-outbound-egress) and the forward-proxy fallback; ask GreenNode |
+| Webhook accepted (`200`) but the guest never gets a reply; runtime log shows `sent=False` (`ConnectError` or timeout) | The Private runtime cannot reach `bot-api.zaloplatforms.com` (no outbound egress) | `GET /ready` (`checks.zalo.bot` empty); [`deploy/agent`](deploy/agent/README.md#5-outbound-egress) and the forward-proxy fallback; ask GreenNode |
 | Webhook `502/503/504` from the proxy | Proxy cannot reach the runtime private endpoint | `RUNTIME_UPSTREAM`, runtime status, routes and security groups, Host header (verify with GreenNode) |
 | Webhook `403` | Wrong or missing Zalo secret | Same `ZALO_WEBHOOK_SECRET` on the runtime and in `setWebhook` |
+| Webhook `503` from the runtime | `ZALO_BOT_TOKEN` or `ZALO_WEBHOOK_SECRET` is not set on the runtime (the webhook never runs unauthenticated); the runtime log says which | Set both, restart the runtime |
 | Webhook `429` / `413` | Proxy rate limit or request size limit | `RATE_EVENTS`, `MAX_BODY` in `deploy/webhook-proxy/.env` |
 | No traces in Langfuse | `LANGFUSE_*` incomplete, security group blocks 3000 from the agent path, wrong host, server version too old for OpenTelemetry | Runtime env; Langfuse web logs; `curl http://<ip>:3000/api/public/health` |
 | Cannot open the Langfuse UI | VPN not connected, missing route to the tunnel network, `NEXTAUTH_URL` mismatch | [`deploy/admin-vpn`](deploy/admin-vpn/README.md) troubleshooting |
@@ -274,11 +276,13 @@ The simulator works 100% without a Zalo token (the UI shows `zalo_configured=fal
 | `AGENTBASE_MEMORY_ID` | Yes | `memory-…` (create as in the travel repo Step 2, with **one CUSTOM strategy** named `customer-profile`, prompt: *"Extract the restaurant guest profile: name, phone, food preferences (vegetarian/spicy/allergies), usual table, birthday, visit history."*) |
 | `MEMORY_STRATEGY_ID` | Yes | that strategy's `ltms-…` ID |
 | `MCP_RESTAURANT_URL` | Yes | connector URL of the **Private gateway**: `<gateway-endpoint-url>/restaurant` (local development: `http://mcp-server:8080/mcp`) |
-| `ZALO_BOT_TOKEN` | optional | enables the real Zalo mode |
-| `ZALO_WEBHOOK_SECRET` | recommended | verifies the `X-Bot-Api-Secret-Token` header |
+| `ZALO_BOT_TOKEN` | optional | enables the real Zalo mode (without it `/webhook/zalo` answers `503`) |
+| `ZALO_WEBHOOK_SECRET` | **required** with `ZALO_BOT_TOKEN` | verifies the `X-Bot-Api-Secret-Token` header in constant time before the body is read; without it the webhook answers `503` and logs an error |
+| `ZALO_MAX_WORKERS` | default `8` | Zalo chats processed at the same time (messages of one chat are always answered in order, one at a time) |
 | `ZALO_API_BASE` | default | `https://bot-api.zaloplatforms.com` |
 | `SERVE_UI` | default `true` | `false` → disable the Web Simulator on the endpoint (Zalo-first mode) |
-| `AGENT_API_KEY` | optional | if set, `/invocations` + `/api/*` require the `X-API-Key` header (the webhook uses its own Zalo secret and is never blocked) |
+| `AGENT_API_KEY` | optional | if set, `/invocations`, `/a2a` and `/api/*` require the `X-API-Key` header; `/api/info` then returns only `{agent, auth_required}` without it (the webhook uses its own Zalo secret and is never blocked; `/health`, `/ready` and the agent card stay open) |
+| `A2A_PUBLIC_URL` | optional | public base URL of this runtime, written into the A2A agent card (`url`); default is the relative `/a2a` |
 | `DEBUG_OPS` | default `0` | `1` enables the `{"op":"whoami"}` identity op — only while setting up policies |
 | `LANGFUSE_HOST` | for traces | self-hosted Langfuse over the private network: `http://<langfuse-private-ip>:3000` |
 | `LANGFUSE_PUBLIC_KEY` · `LANGFUSE_SECRET_KEY` | for traces | project API keys from the private Langfuse (tracing is disabled unless all three `LANGFUSE_*` are set) |
@@ -305,13 +309,13 @@ Per the AgentBase docs, LLM calls on a Runtime go through a **Sidecar LLM Proxy*
 | Method | Path | Description |
 |---|---|---|
 | POST | `/invocations` | simulator/REST chat · headers `X-GreenNode-AgentBase-User-Id` (→ memory `actorId`) + `-Session-Id` (→ `thread_id`) are **required** — missing → `400`, no defaults (the Runtime sets them on real traffic) · `{"op":"whoami"}` |
-| POST | `/a2a` | A2A JSON-RPC; requires `X-GreenNode-AgentBase-User-Id` (missing → `400`) |
-| POST | `/webhook/zalo` | Zalo Bot Platform webhook (secret verification, `message_id` dedupe) |
+| POST | `/a2a` | A2A JSON-RPC; requires `X-GreenNode-AgentBase-User-Id` (missing → `400`) and, when `AGENT_API_KEY` is set, `X-API-Key` |
+| POST | `/webhook/zalo` | Zalo Bot Platform webhook (secret checked first: `403` wrong, `503` not configured; `message_id` dedupe; always `200` for events it ignores) |
 | GET | `/webhook/zalo?challenge=` | manual check |
-| GET | `/api/memory?actor=` · `/api/history` · `/api/actors` | guest profile · conversation · known guests |
-| GET | `/api/bookings` | calls the MCP `list_bookings` tool directly |
-| GET | `/api/info` · `/health` | config (includes `zalo_configured`, bot name) |
-| GET | `/ready` | deep readiness: memory + gateway + LLM + Zalo (200 ok / 503 degraded) |
+| GET | `/api/memory?actor=` · `/api/history` · `/api/actors` | guest profile · conversation · known guests (with `AGENT_API_KEY`: `X-API-Key` required) |
+| GET | `/api/bookings?actor=` | calls the MCP `list_bookings` tool directly with `guest_id=<actor>` (that guest's upcoming bookings) |
+| GET | `/api/info` · `/health` | config (includes `zalo_configured`, bot name, `auth_required`); without the API key `/api/info` hides `memory_id` and `mcp_url` |
+| GET | `/ready` | deep readiness: memory + gateway tools + LLM key decide `200 ok` / `503 degraded`; the Zalo `getMe` result is reported under `checks.zalo` for information only (`getMe` is cached 5 minutes, a failure 30 seconds) |
 
 ## Verified end-to-end (reference demo)
 
@@ -330,7 +334,7 @@ This agent is an **A2A server** (message/send; no streaming):
 | `/a2a` | POST | JSON-RPC 2.0 `message/send` → standard A2A `Message` (contextId + text parts) |
 
 - A2A reuses the same `_chat_turn` as chat and the webhook, so A2A conversations **have guest memory** just like regular Zalo conversations.
-- `POST /a2a` **requires** the `X-GreenNode-AgentBase-User-Id` header (→ memory `actorId`; missing → 400, there is no shared default `a2a` actor). Through AgentBase Runtime the header is attached automatically; when calling directly, send it yourself. If `contextId` is missing, the `X-GreenNode-AgentBase-Session-Id` header is used, and only then a newly generated id.
+- `POST /a2a` is protected by `AGENT_API_KEY` like the other endpoints (send `X-API-Key` when it is set; the agent card advertises the `apiKey` scheme then) and **requires** the `X-GreenNode-AgentBase-User-Id` header (→ memory `actorId`; missing → 400, there is no shared default `a2a` actor). Through AgentBase Runtime the header is attached automatically; when calling directly, send it yourself. If `contextId` is missing, the `X-GreenNode-AgentBase-Session-Id` header is used, and only then a newly generated id.
 - Quick test (the sample message is Vietnamese: "What time does the restaurant close?"):
   ```bash
   curl -s -X POST $ENDPOINT/a2a -H 'Content-Type: application/json' -H 'X-GreenNode-AgentBase-User-Id: guest-1' -d \
@@ -353,27 +357,29 @@ In this deployment Langfuse is **self-hosted and private** in the customer VPC (
 | **Webhook proxy** | exposes only `POST /webhook/zalo`; everything else `404`; TLS, request size limit, per-IP rate limit ([`deploy/webhook-proxy`](deploy/webhook-proxy/README.md)) |
 | **MCP server auth** | fail-closed API key on `/mcp` (`MCP_API_KEYS`, `401` / `503`); only the gateway source range may reach the port; non-root container |
 | **Memory headers validated** | `X-GreenNode-AgentBase-User-Id` / `-Session-Id` are required on `/invocations` and `X-GreenNode-AgentBase-User-Id` on `/a2a` → `400` if missing (no silent defaults → no cross-guest memory mixing). The Zalo webhook derives actor/session from Zalo's `sender_id` / `chat_id` |
-| **Fast webhook ack** | the webhook returns `200` instantly and processes the LLM turn in a background thread — Zalo never times out or retries while the LLM is thinking |
-| **Retry-safe dedupe** | `message_id` is marked seen *before* processing, so a Zalo retry during a slow turn is still dropped |
-| **Zalo secret** | `X-Bot-Api-Secret-Token` is verified on every event; wrong secret → `403` |
+| **Fast webhook ack** | the webhook returns `200` instantly and processes the LLM turn on a bounded worker pool (`ZALO_MAX_WORKERS`) — Zalo never times out or retries while the LLM is thinking, and a flood of chats cannot spawn unlimited threads |
+| **Ordered per chat** | messages of one chat are queued and answered one at a time in the order they arrived; none is dropped |
+| **Retry-safe dedupe** | `message_id` is marked seen *before* processing (bounded TTL cache: 10 minutes, 10,000 entries), so a Zalo retry during a slow turn is still dropped. The cache is **per process**: a restart, or a second replica, can answer a retried message twice |
+| **Zalo secret** | `X-Bot-Api-Secret-Token` is required (no secret configured → `503`), compared in constant time and checked before the body is parsed; wrong secret → `403` |
+| **Generic failures** | a failed turn sends the guest a generic apology (never the exception text) and is logged with a request id |
 | **Zalo-first mode** | `SERVE_UI=false` disables the web simulator on the endpoint — guests interact only in Zalo |
-| **API key on REST** | set `AGENT_API_KEY` → `/invocations` + `/api/*` require `X-API-Key` (the webhook is exempt — it has its own secret) |
+| **API key on REST** | set `AGENT_API_KEY` → `/invocations`, `/a2a` and `/api/*` require `X-API-Key`; `/api/info` reveals nothing without it (the webhook is exempt — it has its own secret) |
 | **Hide runtime identity** | keep `DEBUG_OPS=0` (default) — `whoami` is disabled after policy setup |
 | **Policy Group on the gateway** | only this runtime's principal may call `restaurant__*` (first match wins; no match → 403) |
 | **Private observability** | Langfuse is reachable only on private IPs and through the VPN |
 | **Data persistence** | the MCP server stores bookings/loyalty in SQLite on a persistent volume / PVC — restarts and redeploys keep data; back it up |
-| **Clean 2000-char replies** | long replies are cut at paragraph/line boundaries (never mid-markdown) with a "(…còn tiếp)" note (Vietnamese for "to be continued") |
+| **2000-char replies** | a reply longer than the Zalo limit is split on paragraph / sentence boundaries and sent as several messages in order; no part exceeds 2,000 characters |
 | **Context budget** | history trimmed to the last 40 messages; gateway calls retry with backoff; `recall` degrades gracefully |
 
 ## Tests
 
 ```bash
 pip install -r src/backend/requirements.txt -r src/mcp-server/requirements.txt pytest
-pytest -q                                   # unit tests: MCP server tools + API-key auth, Zalo, A2A, memory headers
+pytest -q                                   # unit tests: MCP server tools + API-key auth, Zalo channel, webhook, REST auth, A2A, memory headers
 bash -n deploy/check_connectivity.sh        # script syntax
 ```
 
-The MCP server tests use a temporary SQLite database per test and cover the fail-closed authentication (`503` without a key, `401` for a wrong key, both header styles, `/health` open).
+The MCP server tests use a temporary SQLite database per test and a frozen clock; they cover guest isolation, ownership on cancel, loyalty (no farming), date / hours / capacity validation, the 2-hour table window, idempotent bookings, tool errors (`isError`) and the fail-closed authentication (`503` without a key, `401` for a wrong key, both header styles, `/health` open). The backend tests use a fake agent turn, a fake Zalo sender and `httpx.MockTransport`: no network is needed.
 
 ## Cost & teardown
 
