@@ -1,14 +1,17 @@
 """POST /webhook/zalo end to end (fake agent turn, fake Zalo sender): secret, parsing, dedupe,
-ordering, empty messages, failure path. No network."""
+ordering, daily sessions, empty messages, failure path. No network."""
 import asyncio
 import logging
 import queue
 import re
+from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage
 from starlette.testclient import TestClient
 
+import agent
+import memory_tools
 import zalo
 
 SECRET = "s3cret-webhook-value"
@@ -36,14 +39,18 @@ def hook(monkeypatch):
     monkeypatch.setattr(zalo, "ZALO_WEBHOOK_SECRET", SECRET)
     monkeypatch.setattr(zalo, "_seen", zalo.SeenCache())
     monkeypatch.setattr(main, "AGENT_API_KEY", "")
+    clock = {"now": datetime(2030, 3, 4, 23, 59, tzinfo=agent.TZ_VN)}
+    monkeypatch.setattr(agent, "now_vn", lambda: clock["now"])
 
     class Hook:
         def __init__(self):
             self.client = TestClient(main.app, raise_server_exceptions=False)
-            self.turns = []                 # (actor, session, text, guest_name) of every agent turn
+            self.clock = clock
+            self.turns = []                 # (text, actor, session, guest_name) of every agent turn
+            self.saved = []                 # (actor, session, user_text, bot_text) of the history writer
             self.sent = queue.Queue()       # (chat_id, text) of every Zalo message sent
             self.delays = {}                # message text -> seconds the fake turn takes
-            self.outcome = {}               # message text -> "error" | "raise"
+            self.fail = set()               # message texts whose turn raises
 
         def post(self, payload, headers=HEADERS):
             return self.client.post("/webhook/zalo", json=payload, headers=headers)
@@ -53,20 +60,22 @@ def hook(monkeypatch):
 
     h = Hook()
 
-    async def fake_turn(actor_id, session_id, message, trace_name="x", guest_name=""):
-        h.turns.append((actor_id, session_id, message, guest_name))
-        await asyncio.sleep(h.delays.get(message, 0))
-        if h.outcome.get(message) == "raise":
+    async def fake_turn(text, user_id, session_id, *, guest_name="", callbacks=None):
+        h.turns.append((text, user_id, session_id, guest_name))
+        await asyncio.sleep(h.delays.get(text, 0))
+        if text in h.fail:
             raise RuntimeError("secret internal failure: http://10.0.0.5/boom")
-        if h.outcome.get(message) == "error":
-            return {"status": "error", "error": "ValueError: secret internal failure"}
-        return {"status": "success", "response": f"re: {message}", "memories_used": []}
+        return agent.TurnResult(f"re: {text}", [])
+
+    async def fake_events(user_id, session_id, user_text, bot_text):
+        h.saved.append((user_id, session_id, user_text, bot_text))
 
     def fake_send(chat_id, text):
         h.sent.put((chat_id, text))
         return {"ok": True, "parts": 1}
 
-    monkeypatch.setattr(main, "_chat_turn", fake_turn)
+    monkeypatch.setattr(agent, "run_turn", fake_turn)
+    monkeypatch.setattr(memory_tools, "add_chat_events", fake_events)
     monkeypatch.setattr(zalo, "send_message", fake_send)
     return h
 
@@ -129,8 +138,9 @@ def test_message_is_answered_with_the_guest_name(hook):
     r = hook.post(msg("Đặt bàn 4 người", name="Hung", user="user-7", chat="chat-7"))
     assert r.status_code == 200 and r.json() == {"message": "Success", "accepted": True}
     assert hook.replies(1) == [("chat-7", "re: Đặt bàn 4 người")]
-    # actor = the Zalo sender, session = one thread per chat, and the display name reaches the agent
-    assert hook.turns == [("user-7", "zalo-chat-7", "Đặt bàn 4 người", "Hung")]
+    # actor = the Zalo sender, session = one thread per chat and day, the display name reaches the agent
+    assert hook.turns == [("Đặt bàn 4 người", "user-7", "zalo-chat-7-20300304", "Hung")]
+    assert hook.saved == [("user-7", "zalo-chat-7-20300304", "Đặt bàn 4 người", "re: Đặt bàn 4 người")]
 
 
 def test_retried_message_is_processed_once(hook):
@@ -174,7 +184,7 @@ def test_two_quick_messages_from_one_chat_are_answered_in_order(hook):
     hook.post(msg("first", mid="o-1"))
     hook.post(msg("second", mid="o-2"))
     assert hook.replies(2) == [("chat-1", "re: first"), ("chat-1", "re: second")]
-    assert [t[2] for t in hook.turns] == ["first", "second"]
+    assert [t[0] for t in hook.turns] == ["first", "second"]
 
 
 def test_a_slow_chat_does_not_block_another_chat(hook):
@@ -187,69 +197,74 @@ def test_a_slow_chat_does_not_block_another_chat(hook):
 # ----------------------------- failure path -----------------------------
 
 
-@pytest.mark.parametrize("how", ["error", "raise"])
-def test_a_failed_turn_sends_a_generic_apology_and_logs_a_request_id(hook, caplog, how):
+def test_a_failed_turn_sends_a_generic_apology_and_logs_a_request_id(hook, caplog):
     import main
 
-    hook.outcome["boom"] = how
+    hook.fail.add("boom")
     with caplog.at_level(logging.ERROR, logger="zalo-restaurant-bot"):
         hook.post(msg("boom"))
-        (chat_id, text), = hook.replies(1)
+        ((chat_id, text),) = hook.replies(1)
     assert chat_id == "chat-1" and text == main.GUEST_APOLOGY
-    assert "secret internal failure" not in text and "RuntimeError" not in text and "ValueError" not in text
+    assert "secret internal failure" not in text and "RuntimeError" not in text
     assert re.search(r"\[[0-9a-f]{8}\] .*chat-1", caplog.text)  # the log line carries a request id
     assert "secret internal failure" in caplog.text  # the details stay in the server log
+    assert hook.saved == []  # a failed turn is not recorded as a conversation
 
 
-def test_an_empty_agent_reply_also_gets_the_apology(hook, monkeypatch):
+def test_the_chat_goes_on_after_a_failed_turn(hook):
+    hook.fail.add("boom")
+    hook.post(msg("boom", mid="f-1"))
+    hook.post(msg("fine", mid="f-2"))
+    assert [text for _, text in hook.replies(2)][1] == "re: fine"
+
+
+# ----------------------------- sessions rotate daily -----------------------------
+
+
+def test_the_session_id_has_the_vietnam_date(hook):
     import main
 
-    async def empty_turn(*args, **kwargs):
-        return {"status": "success", "response": "   "}
+    assert main._zalo_session_id("chat-1") == "zalo-chat-1-20300304"
+    hook.clock["now"] = datetime(2030, 3, 5, 0, 1, tzinfo=agent.TZ_VN)  # just after midnight in Vietnam
+    assert main._zalo_session_id("chat-1") == "zalo-chat-1-20300305"
+    hook.clock["now"] = datetime(2030, 3, 4, 17, 30, tzinfo=agent.TZ_VN).astimezone(UTC)
+    assert main._zalo_session_id("chat-1") == "zalo-chat-1-20300304"  # the date follows Vietnam, not the clock's zone
 
-    monkeypatch.setattr(main, "_chat_turn", empty_turn)
-    hook.post(msg("anything"))
-    assert hook.replies(1) == [("chat-1", main.GUEST_APOLOGY)]
+
+def test_a_chat_gets_a_fresh_session_the_next_day_and_the_same_actor(hook):
+    hook.post(msg("late", mid="d-1"))
+    hook.replies(1)
+    hook.clock["now"] = datetime(2030, 3, 5, 0, 2, tzinfo=agent.TZ_VN)
+    hook.post(msg("early", mid="d-2"))
+    hook.replies(1)
+    assert [(t[1], t[2]) for t in hook.turns] == [
+        ("user-1", "zalo-chat-1-20300304"), ("user-1", "zalo-chat-1-20300305"),
+    ]  # new session, same actor: long-term memory carries the guest across days
 
 
-# ----------------------------- _chat_turn -----------------------------
+@pytest.mark.parametrize("sender,chat", [("bad id", "chat-1"), ("user-1", "chat/1"), ("x" * 200, "chat-1"), ("user-1", "c" * 120)])
+def test_unusual_ids_are_ignored_not_turned_into_memory_namespaces(hook, sender, chat):
+    r = hook.post(msg(user=sender, chat=chat))
+    assert r.status_code == 200 and r.json() == {"message": "Success"}
+    assert hook.turns == [] and hook.sent.empty()
+
+
+# ----------------------------- recording the conversation -----------------------------
 
 
 def test_recording_chat_events_failure_does_not_fail_the_turn(monkeypatch, caplog):
-    import main
-
-    seen = {}
-
-    class FakeAgent:
-        async def ainvoke(self, inputs, config):
-            seen["config"] = config
-            return {"messages": [AIMessage(content="Xin chào Hung!")]}
-
-    async def memory_down(*args):
+    """The history writer is best effort: a memory outage must not turn a good reply into an apology."""
+    async def memory_down(**kwargs):
         raise RuntimeError("memory service unavailable")
 
-    monkeypatch.setattr(main.agent_mod, "get_agent", lambda: FakeAgent())
-    monkeypatch.setattr(main.memory_tools, "add_chat_events", memory_down)
-    with caplog.at_level(logging.ERROR, logger="zalo-restaurant-bot"):
-        result = asyncio.run(main._chat_turn("u1", "zalo-c1", "hi", guest_name="Hung"))
-    assert result["status"] == "success" and result["response"] == "Xin chào Hung!"
-    assert "could not record chat events" in caplog.text
-    assert seen["config"]["configurable"] == {"thread_id": "zalo-c1", "actor_id": "u1", "guest_name": "Hung"}
+    import main
 
+    async def fake_turn(text, user_id, session_id, *, guest_name="", callbacks=None):
+        return agent.TurnResult("Xin chào Hung!", [])
 
-# ----------------------------- /invocations empty message -----------------------------
-
-
-@pytest.mark.parametrize("body", [{}, {"message": ""}, {"message": "   "}, {"input": None}, {"message": 42}])
-def test_invocations_without_a_message_is_400_not_hello(hook, monkeypatch, body):
-    headers = {"X-GreenNode-AgentBase-User-Id": "alice", "X-GreenNode-AgentBase-Session-Id": "s1"}
-    r = hook.client.post("/invocations", json=body, headers=headers)
-    assert r.status_code == 400 and "message" in r.text
-    assert hook.turns == []
-
-
-def test_invocations_with_a_message_reaches_the_agent(hook):
-    headers = {"X-GreenNode-AgentBase-User-Id": "alice", "X-GreenNode-AgentBase-Session-Id": "s1"}
-    r = hook.client.post("/invocations", json={"message": "xin chào"}, headers=headers)
-    assert r.status_code == 200 and r.json()["response"] == "re: xin chào"
-    assert hook.turns == [("alice", "s1", "xin chào", "")]
+    monkeypatch.setattr(agent, "run_turn", fake_turn)
+    monkeypatch.setattr(memory_tools, "_client", SimpleNamespace(create_event_async=memory_down))
+    with caplog.at_level(logging.WARNING, logger="memory-tools"):
+        result = asyncio.run(memory_tools.arun_coro(main._turn_job("t", [], "hi", "u1", "zalo-c1-20300304", "Hung")))
+    assert result.reply == "Xin chào Hung!"
+    assert "could not save conversation events" in caplog.text

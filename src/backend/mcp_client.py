@@ -1,12 +1,14 @@
-"""Thin stateless MCP client over an MCP Gateway / Connector endpoint.
+"""Thin stateless MCP client for an MCP Gateway / Connector endpoint.
 
-Gửi JSON-RPC trực tiếp tới <MCP_URL> (không cần initialize/keep-alive).
-IAM Bearer token lấy từ GREENNODE_CLIENT_ID / GREENNODE_CLIENT_SECRET
-(tự động inject khi chạy trên AgentBase Runtime).
+Sends JSON-RPC requests straight to the MCP URL (no initialize handshake, no keep-alive).
+The IAM Bearer token comes from GREENNODE_CLIENT_ID / GREENNODE_CLIENT_SECRET, which
+AgentBase Runtime injects automatically.
 """
 
 from __future__ import annotations
 
+import base64
+import itertools
 import json
 import logging
 import os
@@ -19,91 +21,113 @@ logger = logging.getLogger("mcp-client")
 
 IAM_TOKEN_URL = "https://iam.api.vngcloud.vn/accounts-api/v2/auth/token"
 
+# Upper bound for a single tool result handed back to the model. Search tools such as
+# Tavily can return 50k+ characters, which would flood the context window.
+MAX_TOOL_OUTPUT_CHARS = 8000
+
+_HTTP_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 0.5
+
 _token_lock = threading.Lock()
 _token_cache: dict = {"token": None, "exp": 0.0}
+_request_ids = itertools.count(1)
+
+
+def jwt_claims(token: str) -> dict:
+    """Decode the payload of a JWT without verifying it. Returns {} if it is malformed."""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(part))
+    except (IndexError, ValueError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
 
 
 def get_token(force: bool = False) -> str:
-    """Lấy IAM token (client credentials), cache với margin 60s."""
+    """Return an IAM access token (client credentials), cached until 60 s before expiry."""
     with _token_lock:
         now = time.time()
         if not force and _token_cache["token"] and now < _token_cache["exp"] - 60:
             return _token_cache["token"]
 
-        cid = os.environ.get("GREENNODE_CLIENT_ID")
-        sec = os.environ.get("GREENNODE_CLIENT_SECRET")
-        if not cid or not sec:
+        client_id = os.environ.get("GREENNODE_CLIENT_ID")
+        client_secret = os.environ.get("GREENNODE_CLIENT_SECRET")
+        if not client_id or not client_secret:
             raise RuntimeError(
-                "Thiếu GREENNODE_CLIENT_ID/GREENNODE_CLIENT_SECRET "
-                "(trên AgentBase Runtime chúng được tự động inject)."
+                "GREENNODE_CLIENT_ID / GREENNODE_CLIENT_SECRET are not set "
+                "(AgentBase Runtime injects them automatically)."
             )
         r = httpx.post(
             IAM_TOKEN_URL,
-            auth=(cid, sec),
+            auth=(client_id, client_secret),
             data={"grant_type": "client_credentials"},
             timeout=30,
         )
         r.raise_for_status()
         token = r.json()["access_token"]
         _token_cache["token"] = token
-        _token_cache["exp"] = float(
-            _jwt_exp(token) if _jwt_exp(token) else now + 1500
-        )
+        _token_cache["exp"] = float(jwt_claims(token).get("exp") or now + 1500)
         return token
 
 
-def _jwt_exp(token: str) -> float:
-    try:
-        import base64
+def _post_with_retry(
+    client: httpx.Client, mcp_url: str, headers: dict, body: dict, *, idempotent: bool
+) -> httpx.Response:
+    """POST with exponential backoff on transient failures.
 
-        part = token.split(".")[1]
-        part += "=" * (-len(part) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(part))
-        return float(claims.get("exp", 0))
-    except Exception:
-        return 0.0
-
-
-_TRANSIENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)
-
-
-def _post_with_retry(client: httpx.Client, mcp_url: str, headers: dict, body: dict,
-                     method: str, attempts: int = 3) -> httpx.Response:
-    """POST với retry/backoff cho lỗi tạm thời.
-
-    - ConnectError/ConnectTimeout: request CHƯA tới server → an toàn retry mọi method.
-    - 5xx/ReadTimeout: chỉ retry với method idempotent (tools/list).
+    - Connection errors (the request never reached the server) are retried for every method.
+    - Read timeouts, HTTP 429 and 5xx are retried only for idempotent methods (tools/list):
+      repeating a tools/call could run the tool twice.
     """
-    delay = 0.5
-    last_exc: Exception | None = None
-    for attempt in range(1, attempts + 1):
+    delay = _RETRY_BASE_DELAY
+    for attempt in range(1, _RETRY_ATTEMPTS):
         try:
-            return client.post(mcp_url, headers=headers, json=body)
+            response = client.post(mcp_url, headers=headers, json=body)
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-            last_exc = e
+            reason = repr(e)
         except httpx.ReadTimeout as e:
-            if method != "tools/list":
+            if not idempotent:
                 raise
-            last_exc = e
-        if attempt < attempts:
-            logger.warning("%s transient (%s) — retry %d/%d sau %.1fs", method, last_exc, attempt, attempts, delay)
-            time.sleep(delay)
-            delay *= 3
-    raise last_exc  # type: ignore[misc]
+            reason = repr(e)
+        else:
+            transient = response.status_code == 429 or response.status_code >= 500
+            if not (idempotent and transient):
+                return response
+            reason = f"HTTP {response.status_code}"
+        logger.warning(
+            "%s transient failure (%s) - retry %d/%d in %.1fs",
+            body["method"], reason, attempt, _RETRY_ATTEMPTS - 1, delay,
+        )
+        time.sleep(delay)
+        delay *= 3
+    # Final attempt: whatever it returns or raises goes back to the caller.
+    return client.post(mcp_url, headers=headers, json=body)
+
+
+def _parse_body(raw: str) -> dict | str:
+    """Parse a JSON-RPC response that is either plain JSON or an SSE stream (`data:` lines)."""
+    try:
+        if raw.lstrip().startswith("{"):
+            return json.loads(raw)
+        for line in raw.splitlines():
+            if not line.startswith("data:"):
+                continue
+            message = json.loads(line[5:].strip())
+            # Skip server notifications that may precede the actual response.
+            if isinstance(message, dict) and ("result" in message or "error" in message):
+                return message
+    except ValueError:
+        logger.warning("MCP response is not valid JSON/SSE (%d chars)", len(raw))
+    return raw
 
 
 def mcp_request(
     mcp_url: str, method: str, params: dict | None = None
 ) -> tuple[int, dict | str]:
-    """POST một JSON-RPC request tới MCP URL. Trả về (http_status, parsed).
-
-    Hỗ trợ cả response JSON thuần và SSE (data: lines).
-    """
-    body: dict = {
-        "jsonrpc": "2.0",
-        "id": int(time.time() * 1000) % 10**9,
-        "method": method,
-    }
+    """POST one JSON-RPC request to the MCP URL. Returns (http_status, parsed_body)."""
+    body: dict = {"jsonrpc": "2.0", "id": next(_request_ids), "method": method}
     if params is not None:
         body["params"] = params
 
@@ -112,62 +136,57 @@ def mcp_request(
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     }
-    with httpx.Client(timeout=120) as client:
-        r = _post_with_retry(client, mcp_url, headers, body, method)
-        if r.status_code == 401:  # token hết hạn → refresh 1 lần rồi retry
+    idempotent = method == "tools/list"
+    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+        r = _post_with_retry(client, mcp_url, headers, body, idempotent=idempotent)
+        if r.status_code == 401:  # token expired or revoked: refresh once and retry
             headers["Authorization"] = f"Bearer {get_token(force=True)}"
-            r = _post_with_retry(client, mcp_url, headers, body, method)
-        elif r.status_code >= 500 and method == "tools/list":
-            delay = 0.5
-            for _attempt in range(2):  # 5xx với tools/list → retry thêm 2 lần
-                time.sleep(delay)
-                r = _post_with_retry(client, mcp_url, headers, body, method)
-                if r.status_code < 500:
-                    break
-                delay *= 3
+            r = _post_with_retry(client, mcp_url, headers, body, idempotent=idempotent)
 
     if r.status_code != 200:
         return r.status_code, r.text[:2000]
-
-    raw = r.text
-    try:
-        if raw.lstrip().startswith("{"):
-            return 200, json.loads(raw)
-        for line in raw.splitlines():  # SSE format
-            if line.startswith("data:"):
-                return 200, json.loads(line[5:].strip())
-    except Exception:
-        return 200, raw
-    return 200, raw
+    return 200, _parse_body(r.text)
 
 
 def list_tools(mcp_url: str) -> list[dict]:
-    """tools/list — trả về danh sách tool definitions."""
-    st, body = mcp_request(mcp_url, "tools/list")
-    if st != 200 or not isinstance(body, dict):
-        raise RuntimeError(f"tools/list thất bại ({st}): {str(body)[:300]}")
+    """tools/list - return the tool definitions."""
+    status, body = mcp_request(mcp_url, "tools/list")
+    if status != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"tools/list failed ({status}): {str(body)[:300]}")
+    if "error" in body:
+        raise RuntimeError(f"tools/list returned an error: {json.dumps(body['error'])[:300]}")
     return body.get("result", {}).get("tools", [])
 
 
-def call_tool(mcp_url: str, tool: str, arguments: dict) -> str:
-    """tools/call — trả về text content; nhận diện DENIED_BY_POLICY.
+def _truncate(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n...[truncated {len(text) - limit} chars]"
 
-    MCP Gateway trả deny dưới 2 dạng (tuỳ version):
-      - HTTP 403 trực tiếp
-      - HTTP 200 + result.isError=true + text chứa "denied by policy"
+
+def call_tool(mcp_url: str, tool: str, arguments: dict) -> str:
+    """tools/call - return the tool's text content, capped at MAX_TOOL_OUTPUT_CHARS.
+
+    The MCP Gateway reports a policy denial in one of two ways (depending on its version):
+      - HTTP 403
+      - HTTP 200 + result.isError=true + text containing "denied by policy"
+    Both are returned as a string starting with DENIED_BY_POLICY, which the system prompt
+    tells the model to treat as "this tool is not allowed". Any other `isError` result is
+    returned with a TOOL_ERROR prefix so the model can tell the tool failed.
     """
-    st, body = mcp_request(mcp_url, "tools/call", {"name": tool, "arguments": arguments})
-    if st == 403:
+    status, body = mcp_request(mcp_url, "tools/call", {"name": tool, "arguments": arguments})
+    if status == 403:
+        logger.info("tools/call %s denied by policy (HTTP 403)", tool)
         return (
-            f"DENIED_BY_POLICY (HTTP 403): tool '{tool}' không được phép cho agent này "
-            f"theo Policy Group của MCP Gateway. Body: {body}"
+            f"DENIED_BY_POLICY (HTTP 403): tool '{tool}' is not allowed for this agent "
+            "by the MCP Gateway Policy Group."
         )
-    if st != 200:
-        return f"MCP_ERROR (HTTP {st}) khi gọi tool '{tool}': {body}"
+    if status != 200:
+        return _truncate(f"MCP_ERROR (HTTP {status}) calling tool '{tool}': {body}")
     if not isinstance(body, dict):
-        return str(body)[:4000]
+        return _truncate(str(body))
     if "error" in body:
-        return f"MCP_RPC_ERROR: {json.dumps(body['error'])[:2000]}"
+        return _truncate(f"MCP_RPC_ERROR: {json.dumps(body['error'])}")
 
     result = body.get("result", {})
     texts = [
@@ -177,8 +196,11 @@ def call_tool(mcp_url: str, tool: str, arguments: dict) -> str:
     ]
     joined = "\n".join(texts)
     if result.get("isError") and "denied by policy" in joined.lower():
+        logger.info("tools/call %s denied by policy (isError result)", tool)
         return (
-            f"DENIED_BY_POLICY: tool '{tool}' không được phép cho agent này "
-            f"theo Policy Group của MCP Gateway."
+            f"DENIED_BY_POLICY: tool '{tool}' is not allowed for this agent "
+            "by the MCP Gateway Policy Group."
         )
-    return joined or json.dumps(result)[:4000]
+    if result.get("isError"):
+        return _truncate(f"TOOL_ERROR: {joined or json.dumps(result)}")
+    return _truncate(joined or json.dumps(result))

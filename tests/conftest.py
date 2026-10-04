@@ -1,7 +1,4 @@
-"""Set dummy env BEFORE importing the backend modules (agent.py raises when a key is missing).
-
-MCP_DB_PATH points to a temp dir in the MCP server tests, so they never touch a real database.
-"""
+"""Test setup: dummy environment BEFORE the backend modules are imported (agent.py validates it)."""
 import os
 import sys
 from pathlib import Path
@@ -11,10 +8,14 @@ os.environ.setdefault("LLM_MODEL", "test-model")
 os.environ.setdefault("AGENTBASE_MEMORY_ID", "memory-test")
 os.environ.setdefault("MEMORY_STRATEGY_ID", "ltms-cust-test")
 os.environ.setdefault("MCP_RESTAURANT_URL", "https://gw.example/restaurant")
-
-BACKEND = Path(__file__).resolve().parent.parent / "src" / "backend"
-MCP_SERVER = Path(__file__).resolve().parent.parent / "src" / "mcp-server"
-# BACKEND must come FIRST on sys.path: both folders have a main.py, and
-# `import main` in a test has to resolve to src/backend/main.py.
-sys.path.insert(0, str(MCP_SERVER))
-sys.path.insert(0, str(BACKEND))
+# Optional settings are set to "" (not removed): main.py calls load_dotenv(), which would otherwise
+# fill a missing variable from a real .env file found in a parent directory.
+for name in (
+    "AGENT_API_KEY", "ZALO_BOT_TOKEN", "ZALO_WEBHOOK_SECRET", "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST", "GREENNODE_CLIENT_ID", "GREENNODE_CLIENT_SECRET",
+):
+    os.environ[name] = ""
+# Both src/backend and src/mcp-server have a main.py: only the backend is put on sys.path (the MCP
+# server tests load their module by file path), so `import main` is always the backend's.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
