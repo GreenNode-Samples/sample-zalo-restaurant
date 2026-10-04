@@ -92,12 +92,24 @@ needs the **AgentBase private connection** (VPC peering) to be activated for you
 
 ### Components
 
-- **`src/mcp-server`**: a FastMCP server (stateless HTTP) with 7 restaurant tools: `get_menu`, `check_availability`,
-  `create_booking`, `list_bookings`, `cancel_booking`, `get_loyalty`, `add_loyalty_points`. It runs **in the customer VPC, not on AgentBase**.
+- **`src/mcp-server`**: a FastMCP server (stateless HTTP) with 7 restaurant tools: `restaurant_info`, `get_menu`, `check_availability`,
+  `create_booking`, `list_bookings`, `cancel_booking`, `get_loyalty`. It runs **in the customer VPC, not on AgentBase**.
   Authentication is **fail-closed**: `/mcp` requires an API key (`MCP_API_KEYS`, header `X-Api-Key` or `Authorization: Bearer`);
-  with no key configured it answers `503`, with a wrong key `401`; `/health` stays open. Bookings and loyalty points are stored in
+  with no key configured it answers `503`, with a wrong key `401`; `/health` stays open. Keys shorter than 32 characters or containing `<` / `>`
+  (template placeholders) make the server refuse to start. Bookings and loyalty points are stored in
   **SQLite** (`MCP_DB_PATH`, `/app/data/restaurant.db` in the container) on a persistent volume, so restarts and redeploys keep the data.
-  The image runs as a non-root user.
+  The image runs as a non-root user. Tool contract (details are in each tool's docstring):
+  - **Guest identity**: `create_booking`, `list_bookings`, `cancel_booking` and `get_loyalty` take a `guest_id`, an opaque id (the Zalo user id) that the
+    agent platform supplies, never the guest or the model. All guest data is keyed by it: a guest only ever sees and cancels their own bookings, and
+    `customer` is just the display name printed on a booking.
+  - **Loyalty**: points cannot be set by any tool. A booking earns 10 points on the server and cancelling it takes them back, so booking and cancelling repeatedly earns nothing.
+  - **Validation**: `date` is ISO `YYYY-MM-DD` and not in the past (Asia/Ho_Chi_Minh), `time` is `HH:MM` between 10:00 and 21:00 (last seating; the restaurant closes at 22:00),
+    party size 1 to 12, an explicit table must exist and seat the party. Constants (`OPENING_TIME`, `CLOSING_TIME`, `LAST_SEATING`, restaurant name, address and phone) are at the top of `main.py`.
+  - **Slots**: a booking holds its table for 2 hours, so 19:00 and 19:30 on the same table conflict. The smallest free table that fits is chosen (numeric order: `T2` before `T10`).
+    Booking the same guest, date and time twice returns the existing booking (`"created": false`) instead of a duplicate.
+  - **Errors and output**: tools return JSON objects (MCP structured output); failures are MCP tool errors (`isError: true`) whose message says how to fix the call.
+    `list_bookings` returns only upcoming bookings, at most 20, with a `truncated` flag.
+  - A `restaurant.db` created by the earlier version of this sample (bookings keyed by name) is refused at startup: back it up and delete it.
 - **`src/backend`**: LangGraph agent + Memory (1 **CUSTOM** strategy "customer-profile") + the Zalo webhook (**ack 200 immediately, LLM turn runs in a
   background thread**: Zalo never waits on the LLM; secret verification, retry dedupe, replies with `parse_mode=markdown` cut cleanly at the 2000-char limit).
   This is the **only** image deployed to AgentBase.
@@ -163,9 +175,9 @@ named `customer-profile`.
 
       ```json
       {"effect": "allow", "principal": "iam:<runtime-token_sub>", "resources": ["gateway:zalo-private-gw"],
-       "actions": ["restaurant__get_menu", "restaurant__check_availability", "restaurant__create_booking",
-                   "restaurant__list_bookings", "restaurant__cancel_booking", "restaurant__get_loyalty",
-                   "restaurant__add_loyalty_points"]}
+       "actions": ["restaurant__restaurant_info", "restaurant__get_menu", "restaurant__check_availability",
+                   "restaurant__create_booking", "restaurant__list_bookings", "restaurant__cancel_booking",
+                   "restaurant__get_loyalty"]}
       ```
 4. **Langfuse (private)**: [`deploy/langfuse/vserver`](deploy/langfuse/vserver/README.md) (compose) **or** [`deploy/langfuse/vks`](deploy/langfuse/vks/README.md) (Helm). Bind to private IPs;
    security group port 3000 only from the agent path and the VPN client range.
@@ -275,7 +287,7 @@ MCP server variables (set on the vServer / VKS, **not** on the AgentBase runtime
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `MCP_API_KEYS` | Yes | comma-separated API key(s) accepted on `/mcp` (`X-Api-Key` or `Authorization: Bearer`); generate with `openssl rand -hex 32`; unset = `503` (fail-closed) |
+| `MCP_API_KEYS` | Yes | comma-separated API key(s) accepted on `/mcp` (`X-Api-Key` or `Authorization: Bearer`); generate with `openssl rand -hex 32`; each key needs 32+ characters and no `<` / `>` or the server refuses to start; unset = `503` (fail-closed) |
 | `ALLOW_ANONYMOUS` | local only | `true` lets `/mcp` run without a key when `MCP_API_KEYS` is empty |
 | `PORT` | default `8080` | listen port |
 | `MCP_DB_PATH` | default `data/restaurant.db` (`/app/data/restaurant.db` in the image) | SQLite path (bookings/loyalty persistence); keep it on the persistent volume |

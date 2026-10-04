@@ -6,13 +6,20 @@ Private MCP Gateway (Outbound Auth = API Key, header `X-Api-Key`). The agent run
 it only through the gateway: Agent -> MCP Gateway -> Policy Group -> connector -> this server.
 
 Auth (fail-closed): /mcp requires an API key.
-  - MCP_API_KEYS="key1,key2"  (several keys allow rotation without downtime)
+  - MCP_API_KEYS="key1,key2"  (several keys allow rotation without downtime). Every key must be
+    at least 32 characters and must not contain `<` or `>` (template placeholders): the server
+    refuses to start otherwise.
   - Header: `X-Api-Key: <key>` or `Authorization: Bearer <key>`
   - No key configured -> /mcp returns 503 (it never opens itself). Set ALLOW_ANONYMOUS=true
     only for local development.
   - A wrong or missing key -> 401. /health and / are always open (health probes).
   The gateway attaches the key when it forwards a call (the secret lives in Access Control),
   so the agent never sees it.
+
+Guest identity: every tool that reads or writes guest data takes a `guest_id`, an opaque string
+that identifies the guest (the Zalo user id). The agent platform supplies it, never the guest and
+never the model, and all guest data (bookings, loyalty points) is keyed by it. `customer` is only
+the display name printed on a booking.
 
 State is stored in **SQLite** (bookings + loyalty), so a restart does not lose data. The DB
 path comes from env `MCP_DB_PATH` (default `data/restaurant.db` next to this file, which is
@@ -25,39 +32,73 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
-import threading
-import time as _time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import date as Date
+from datetime import datetime, timedelta
+from datetime import time as Time
 from pathlib import Path
+from typing import Annotated, Any, Literal
+from zoneinfo import ZoneInfo
 
-from starlette.routing import Route
-from starlette.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("restaurant-mcp")
 
 # ------------------------- Auth configuration -------------------------
 
+MIN_API_KEY_LENGTH = 32
+
 
 def _load_api_keys() -> list[str]:
-    raw = os.environ.get("MCP_API_KEYS", "")
-    return [k.strip() for k in raw.split(",") if k.strip()]
+    """Read MCP_API_KEYS and refuse placeholders and short keys (fail closed at startup)."""
+    keys = [k.strip() for k in os.environ.get("MCP_API_KEYS", "").split(",") if k.strip()]
+    for key in keys:
+        if "<" in key or ">" in key or len(key) < MIN_API_KEY_LENGTH:
+            raise ValueError(
+                f"MCP_API_KEYS contains a placeholder or a key shorter than {MIN_API_KEY_LENGTH} "
+                "characters; generate a real one with `openssl rand -hex 32`"
+            )
+    return keys
 
 
 API_KEYS = _load_api_keys()
 ALLOW_ANONYMOUS = os.environ.get("ALLOW_ANONYMOUS", "").strip().lower() in ("1", "true", "yes")
-for _k in API_KEYS:
-    if len(_k) < 24:
-        log.warning("MCP_API_KEYS contains a key shorter than 24 characters; use `openssl rand -hex 32`")
 
 mcp = FastMCP("restaurant", stateless_http=True, json_response=True, host="0.0.0.0")
 
-# ------------------------- Static data -------------------------
-# Dish names are the restaurant's Vietnamese menu names (proper nouns); notes are in English.
+# ------------------------- Restaurant data -------------------------
 
+TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+# Sample details: replace them with your restaurant's real data.
+RESTAURANT_NAME = "Quán Ngon 123"
+RESTAURANT_ADDRESS = "123 Nguyen Hue, District 1, Ho Chi Minh City"
+RESTAURANT_PHONE = "+84 28 0000 0000"
+
+OPENING_TIME = Time(10, 0)
+CLOSING_TIME = Time(22, 0)
+LAST_SEATING = Time(21, 0)
+# A booking holds its table for this long: two bookings on the same table must start at least
+# this many minutes apart.
+SEATING_MINUTES = 120
+POINTS_PER_BOOKING = 10
+MAX_LIST = 20
+MAX_NAME_LENGTH = 80
+MAX_NOTES_LENGTH = 500
+MAX_GUEST_ID_LENGTH = 128
+
+# Dish names are the restaurant's Vietnamese menu names (proper nouns); notes are in English.
 MENU = {
     "khai-vi": [
         {"id": "A1", "name": "Gỏi cuốn tôm thịt", "price": 45000, "note": "fresh shrimp and pork spring rolls; vegetarian dipping sauce available"},
@@ -65,7 +106,7 @@ MENU = {
         {"id": "A3", "name": "Nộm xoài khô bò", "price": 50000, "note": "spicy dried-beef mango salad"},
     ],
     "mon-chinh": [
-        {"id": "M1", "name": "Bò bò kho bánh mì", "price": 89000, "note": "beef stew with bread"},
+        {"id": "M1", "name": "Bò kho bánh mì", "price": 89000, "note": "beef stew with bread"},
         {"id": "M2", "name": "Cá kho tộ", "price": 120000, "note": "caramelised fish in clay pot"},
         {"id": "M3", "name": "Cơm cháy cá sặc", "price": 95000, "note": "crispy rice with snakeskin gourami fish"},
         {"id": "M4", "name": "Lẩu gà lá chanh", "price": 350000, "note": "lime-leaf chicken hotpot, serves 4"},
@@ -84,6 +125,10 @@ MENU = {
 
 # Tables T1..T12 with different capacities
 TABLES = {f"T{i}": seats for i, seats in enumerate([2, 2, 4, 4, 4, 4, 6, 6, 8, 8, 10, 12], start=1)}
+MAX_PARTY_SIZE = max(TABLES.values())
+
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+TIME_RE = re.compile(r"\d{2}:\d{2}")
 
 # ------------------------- SQLite persistence -------------------------
 
@@ -102,29 +147,51 @@ def _resolve_db_path() -> str:
     except OSError:
         # Read-only filesystem fallback. In production set MCP_DB_PATH to a path on the
         # persistent volume so data is never silently written to ephemeral storage.
-        logging.getLogger("restaurant-mcp").warning(
-            "default data dir %s is not writable; falling back to /tmp (data is NOT persistent)",
-            default.parent)
+        log.warning("default data dir %s is not writable; falling back to /tmp (data is NOT persistent)",
+                    default.parent)
         return "/tmp/restaurant.db"
 
 
 DB_PATH = _resolve_db_path()
-_write_lock = threading.Lock()  # FastMCP tools run in a thread pool: serialise writes
 
 
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+@contextmanager
+def _db(write: bool = False) -> Iterator[sqlite3.Connection]:
+    """Open a connection, always close it, and make writes atomic.
+
+    A write opens `BEGIN IMMEDIATE`, so the availability check and the insert of a booking form
+    one serialised unit; an exception (for example a ToolError) rolls the whole unit back.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        if write:
+            conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        if write:
+            conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def _init_db() -> None:
     with _db() as conn:
+        columns = {r["name"] for r in conn.execute("SELECT name FROM pragma_table_info('bookings')")}
+        if columns and "guest_id" not in columns:
+            raise RuntimeError(
+                f"{DB_PATH} was created by an older version of this sample (bookings are keyed by "
+                "guest name, not guest_id). Back it up and delete it to start with the new schema."
+            )
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS bookings (
                 id         TEXT PRIMARY KEY,
+                guest_id   TEXT NOT NULL,
                 customer   TEXT NOT NULL,
                 date       TEXT NOT NULL,
                 time       TEXT NOT NULL,
@@ -134,17 +201,20 @@ def _init_db() -> None:
                 notes      TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_bookings_slot ON bookings(date, time, status);
+            CREATE INDEX IF NOT EXISTS idx_bookings_date ON bookings(date, status);
+            CREATE INDEX IF NOT EXISTS idx_bookings_guest ON bookings(guest_id, status);
             CREATE TABLE IF NOT EXISTS loyalty (
-                customer TEXT PRIMARY KEY,
+                guest_id TEXT PRIMARY KEY,
                 points   INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS loyalty_history (
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                customer TEXT NOT NULL,
+                guest_id TEXT NOT NULL,
                 ts       TEXT NOT NULL,
+                delta    INTEGER NOT NULL,
                 reason   TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_loyalty_history_guest ON loyalty_history(guest_id, id);
             """
         )
 
@@ -152,7 +222,16 @@ def _init_db() -> None:
 _init_db()
 
 
-def _row_to_booking(r: sqlite3.Row) -> dict:
+def _now() -> datetime:
+    """Current time in the restaurant's timezone (a seam for tests)."""
+    return datetime.now(TZ)
+
+
+def _table_number(table: str) -> int:
+    return int(table[1:])
+
+
+def _row_to_booking(r: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": r["id"],
         "customer": r["customer"],
@@ -166,164 +245,408 @@ def _row_to_booking(r: sqlite3.Row) -> dict:
     }
 
 
-def _busy_tables(conn: sqlite3.Connection, date: str, time: str) -> set[str]:
+def _minutes(hhmm: str) -> int:
+    return int(hhmm[:2]) * 60 + int(hhmm[3:])
+
+
+def _free_tables(conn: sqlite3.Connection, date: str, hhmm: str, party_size: int) -> list[str]:
+    """Tables that seat the party and are not held by another booking around that time.
+
+    Sorted smallest first, then by table number (numeric: T2 before T10).
+    """
+    start = _minutes(hhmm)
     rows = conn.execute(
-        "SELECT table_id FROM bookings WHERE date=? AND time=? AND status='CONFIRMED'",
-        (date, time),
+        "SELECT table_id, time FROM bookings WHERE date=? AND status='CONFIRMED'", (date,)
     ).fetchall()
-    return {r["table_id"] for r in rows}
+    busy = {r["table_id"] for r in rows if abs(_minutes(r["time"]) - start) < SEATING_MINUTES}
+    fits = [t for t, seats in TABLES.items() if seats >= party_size and t not in busy]
+    return sorted(fits, key=lambda t: (TABLES[t], _table_number(t)))
 
 
-def _loyalty_add(conn: sqlite3.Connection, customer: str, points: int, reason: str) -> None:
+def _loyalty_add(conn: sqlite3.Connection, guest_id: str, delta: int, reason: str) -> int:
+    """Apply a points change and return the new balance (server-side only, never a tool)."""
     conn.execute(
-        "INSERT INTO loyalty(customer, points) VALUES(?, ?) "
-        "ON CONFLICT(customer) DO UPDATE SET points = points + ?",
-        (customer, points, points),
+        "INSERT INTO loyalty(guest_id, points) VALUES(?, ?) "
+        "ON CONFLICT(guest_id) DO UPDATE SET points = points + excluded.points",
+        (guest_id, delta),
     )
     conn.execute(
-        "INSERT INTO loyalty_history(customer, ts, reason) VALUES(?, ?, ?)",
-        (customer, _time.strftime("%Y-%m-%dT%H:%M:%S"), reason),
+        "INSERT INTO loyalty_history(guest_id, ts, delta, reason) VALUES(?, ?, ?, ?)",
+        (guest_id, _now().isoformat(timespec="seconds"), delta, reason),
     )
+    return conn.execute("SELECT points FROM loyalty WHERE guest_id=?", (guest_id,)).fetchone()["points"]
 
 
-def _ok(payload: dict) -> str:
-    return json.dumps({"ok": True, **payload}, ensure_ascii=False)
+# ------------------------- Input validation -------------------------
 
 
-def _err(msg: str) -> str:
-    return json.dumps({"ok": False, "error": msg}, ensure_ascii=False)
+def _guest(guest_id: str) -> str:
+    gid = (guest_id or "").strip()
+    if not gid or len(gid) > MAX_GUEST_ID_LENGTH:
+        raise ToolError(
+            f"guest_id is required (1-{MAX_GUEST_ID_LENGTH} characters). It identifies the guest and is "
+            "supplied by the agent platform: do not ask the guest for it and do not invent one."
+        )
+    return gid
+
+
+def _party(party_size: int) -> int:
+    if not 1 <= party_size <= MAX_PARTY_SIZE:
+        raise ToolError(
+            f"party_size must be between 1 and {MAX_PARTY_SIZE} (the largest table). For bigger "
+            f"groups the guest should call the restaurant on {RESTAURANT_PHONE}."
+        )
+    return party_size
+
+
+def _parse_slot(date_str: str, time_str: str) -> datetime:
+    """Validate a booking date and time and return the slot start (restaurant timezone)."""
+    now = _now()
+    if not DATE_RE.fullmatch(date_str or ""):
+        raise ToolError(
+            f"date must be ISO YYYY-MM-DD, for example '{now.date().isoformat()}', got {date_str!r}. "
+            "Convert relative dates such as 'tomorrow' or 'Saturday' to an ISO date first."
+        )
+    try:
+        day = Date.fromisoformat(date_str)
+    except ValueError:
+        raise ToolError(f"date {date_str!r} is not a real calendar date; use ISO YYYY-MM-DD.") from None
+    if not TIME_RE.fullmatch(time_str or ""):
+        raise ToolError(f"time must be 24-hour HH:MM, for example '19:30', got {time_str!r}.")
+    hour, minute = int(time_str[:2]), int(time_str[3:])
+    if hour > 23 or minute > 59:
+        raise ToolError(f"time {time_str!r} is not a real time of day; use 24-hour HH:MM, for example '19:30'.")
+    start = Time(hour, minute)
+    if not OPENING_TIME <= start <= LAST_SEATING:
+        raise ToolError(
+            f"{time_str} is outside the booking hours. The restaurant is open "
+            f"{OPENING_TIME:%H:%M}-{CLOSING_TIME:%H:%M} and the last seating is {LAST_SEATING:%H:%M}; "
+            "ask the guest for another time."
+        )
+    slot = datetime.combine(day, start, tzinfo=TZ)
+    if slot <= now:
+        raise ToolError(
+            f"{date_str} {time_str} is in the past (it is now {now:%Y-%m-%d %H:%M} in Ho Chi Minh City). "
+            "Ask the guest for a future date and time."
+        )
+    return slot
+
+
+def _clean_text(value: str, field: str, max_length: int, required: bool = False) -> str:
+    text = " ".join((value or "").split())
+    if required and not text:
+        raise ToolError(f"{field} is required.")
+    if len(text) > max_length:
+        raise ToolError(f"{field} is too long ({len(text)} characters, maximum {max_length}); shorten it.")
+    return text
 
 
 # ------------------------- MCP Tools -------------------------
 
+TOOL_NAMES: list[str] = []
 
-@mcp.tool()
-def get_menu(category: str = "") -> str:
-    """Show the menu. An empty category returns everything (khai-vi, mon-chinh, nuoc, trang-mieng)."""
-    if category:
-        items = MENU.get(category)
-        if items is None:
-            return _err(f"unknown category '{category}'")
-        return _ok({"category": category, "items": items})
-    return _ok({"menu": MENU})
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+_DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False)
 
-
-@mcp.tool()
-def check_availability(date: str, time: str, party_size: int) -> str:
-    """Check free tables for a date, time and party size. date 'YYYY-MM-DD', time 'HH:MM'."""
-    if party_size <= 0 or party_size > 20:
-        return _err("party_size must be between 1 and 20")
-    with _db() as conn:
-        busy = _busy_tables(conn, date, time)
-    free = [
-        {"table": t, "seats": seats}
-        for t, seats in sorted(TABLES.items())
-        if t not in busy and seats >= party_size
-    ]
-    return _ok({"date": date, "time": time, "party_size": party_size, "available": free[:5]})
+# Argument formats are described here and enforced in the tool bodies, so a bad value comes back
+# as a ToolError that says how to fix it (a schema `pattern` would only give a pydantic message).
+GuestId = Annotated[str, Field(
+    description="Opaque guest identifier supplied by the agent platform (the Zalo user id). "
+                "Never ask the guest for it and never invent one.")]
+DateArg = Annotated[str, Field(
+    description="Date as ISO YYYY-MM-DD in Ho Chi Minh City time, for example '2026-10-17'.")]
+TimeArg = Annotated[str, Field(
+    description="Start time as 24-hour HH:MM, for example '19:30'. Bookings run 10:00-21:00.")]
+PartySize = Annotated[int, Field(
+    description=f"Number of guests, 1 to {MAX_PARTY_SIZE}, for example 4.")]
 
 
-@mcp.tool()
-def create_booking(
-    customer: str, date: str, time: str, party_size: int, table: str = "", notes: str = ""
-) -> str:
-    """Create a booking. Use notes for allergies, favourite dishes, special occasions, etc."""
-    if party_size <= 0 or party_size > 20:
-        return _err("party_size must be between 1 and 20")
-    if table and table not in TABLES:
-        return _err(f"table {table} does not exist")
-    if not customer.strip():
-        return _err("customer name is required")
+def _tool(annotations: ToolAnnotations):
+    """Register a function as an MCP tool and remember its name (used by /health and /)."""
+    def register(fn):
+        TOOL_NAMES.append(fn.__name__)
+        return mcp.tool(annotations=annotations)(fn)
+    return register
 
-    bid = f"bk-{uuid.uuid4().hex[:8]}"
-    created_at = _time.strftime("%Y-%m-%dT%H:%M:%S")
 
-    with _write_lock, _db() as conn:
-        busy = _busy_tables(conn, date, time)
-        if table and table in busy:
-            return _err(f"table {table} is already booked for this slot")
-        if not table:
-            free = [t for t in sorted(TABLES) if t not in busy and TABLES[t] >= party_size]
-            if not free:
-                return _err("no suitable table is free for this slot")
-            table = free[0]
-        conn.execute(
-            "INSERT INTO bookings(id, customer, date, time, party_size, table_id, status, notes, created_at) "
-            "VALUES(?,?,?,?,?,?,'CONFIRMED',?,?)",
-            (bid, customer.strip(), date, time, party_size, table, notes, created_at),
-        )
-        _loyalty_add(conn, customer.strip(), 10, f"booking {bid} +10 points")
+@_tool(_READ_ONLY)
+def restaurant_info() -> dict[str, Any]:
+    """Return the restaurant's name, address, phone number and opening hours.
 
-    booking = {
-        "id": bid, "customer": customer.strip(), "date": date, "time": time,
-        "party_size": party_size, "table": table, "status": "CONFIRMED",
-        "notes": notes, "created_at": created_at,
+    Use it for questions such as "what time do you close?", "where are you?" or "what is your
+    phone number?". Takes no arguments.
+
+    Returns:
+        name, address, phone, timezone, opening_hours (open, close, last_seating as HH:MM),
+        seating_minutes (how long a booking holds a table) and max_party_size.
+    """
+    return {
+        "name": RESTAURANT_NAME,
+        "address": RESTAURANT_ADDRESS,
+        "phone": RESTAURANT_PHONE,
+        "timezone": str(TZ),
+        "opening_hours": {
+            "open": f"{OPENING_TIME:%H:%M}",
+            "close": f"{CLOSING_TIME:%H:%M}",
+            "last_seating": f"{LAST_SEATING:%H:%M}",
+        },
+        "seating_minutes": SEATING_MINUTES,
+        "max_party_size": MAX_PARTY_SIZE,
     }
-    return _ok({"booking": booking})
 
 
-@mcp.tool()
-def list_bookings(customer: str = "") -> str:
-    """List bookings (filtered by guest when customer is given)."""
+@_tool(_READ_ONLY)
+def get_menu(
+    category: Annotated[Literal["all", "khai-vi", "mon-chinh", "nuoc", "trang-mieng"], Field(
+        description="Menu section: khai-vi (starters), mon-chinh (mains), nuoc (drinks), "
+                    "trang-mieng (desserts) or all (default).")] = "all",
+) -> dict[str, Any]:
+    """Show the menu, with prices in VND.
+
+    Args:
+        category: 'khai-vi', 'mon-chinh', 'nuoc', 'trang-mieng', or 'all' (default) for everything.
+
+    Returns:
+        With a category: {"category": ..., "items": [{"id", "name", "price", "note"}]}.
+        With 'all': {"menu": {category: [items]}}.
+
+    Errors:
+        Unknown category: the message lists the valid ones.
+    """
+    if category == "all":
+        return {"menu": MENU}
+    items = MENU.get(category)
+    if items is None:
+        raise ToolError(f"unknown category {category!r}; use one of: all, {', '.join(MENU)}.")
+    return {"category": category, "items": items}
+
+
+@_tool(_READ_ONLY)
+def check_availability(date: DateArg, time: TimeArg, party_size: PartySize) -> dict[str, Any]:
+    """List the tables that are free for a date, time and party size.
+
+    A booking holds its table for 2 hours, so a table booked at 19:00 is not free at 19:30.
+
+    Args:
+        date: ISO date YYYY-MM-DD, for example '2026-10-17'. Today or later.
+        time: 24-hour HH:MM, for example '19:30', between 10:00 and 21:00 (last seating).
+        party_size: number of guests, 1 to 12, for example 4.
+
+    Returns:
+        {"date", "time", "party_size", "available": [{"table", "seats"}]} with the smallest
+        suitable tables first. An empty list means the slot is full: suggest another time.
+
+    Errors:
+        Invalid or past date, time outside opening hours, party size out of range.
+    """
+    slot = _parse_slot(date, time)
+    _party(party_size)
     with _db() as conn:
-        if customer:
-            rows = conn.execute(
-                "SELECT * FROM bookings WHERE lower(customer)=lower(?) ORDER BY created_at DESC LIMIT 100",
-                (customer.strip(),),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM bookings ORDER BY created_at DESC LIMIT 100"
-            ).fetchall()
-    return _ok({"bookings": [_row_to_booking(r) for r in rows]})
+        free = _free_tables(conn, slot.date().isoformat(), time, party_size)
+    return {
+        "date": date, "time": time, "party_size": party_size,
+        "available": [{"table": t, "seats": TABLES[t]} for t in free],
+    }
 
 
-@mcp.tool()
-def cancel_booking(booking_id: str) -> str:
-    """Cancel a booking by id (bk-xxxx)."""
-    with _write_lock, _db() as conn:
-        row = conn.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
-        if row is None:
-            return _err(f"booking {booking_id} not found")
-        conn.execute("UPDATE bookings SET status='CANCELLED' WHERE id=?", (booking_id,))
-    booking = _row_to_booking(row)
-    booking["status"] = "CANCELLED"
-    return _ok({"booking": booking})
+@_tool(_WRITE)
+def create_booking(
+    guest_id: GuestId,
+    customer: Annotated[str, Field(
+        description="Guest's name as it should appear on the booking, for example 'Hung'.")],
+    date: DateArg,
+    time: TimeArg,
+    party_size: PartySize,
+    table: Annotated[str, Field(
+        description="Optional table id such as 'T3'. Leave empty to get the smallest free table that fits.")] = "",
+    notes: Annotated[str, Field(
+        description="Optional free text: allergies, favourite dishes, special occasion.")] = "",
+) -> dict[str, Any]:
+    """Book a table for a guest and award loyalty points.
+
+    Confirm the details with the guest before calling it. The booking holds the table for
+    2 hours and earns the guest 10 loyalty points (reversed if the booking is cancelled).
+    Calling it again for the same guest, date and time does not create a second booking: it
+    returns the existing one with "created": false.
+
+    Args:
+        guest_id: opaque guest identifier supplied by the agent platform (Zalo user id).
+        customer: guest's name for the booking, for example 'Hung'.
+        date: ISO date YYYY-MM-DD, today or later, for example '2026-10-17'.
+        time: 24-hour HH:MM between 10:00 and 21:00, for example '19:30'.
+        party_size: number of guests, 1 to 12, for example 4.
+        table: optional table id, for example 'T3'. It must seat the party and be free.
+        notes: optional allergies, favourite dishes or occasion, up to 500 characters.
+
+    Returns:
+        {"created": true, "booking": {...}, "loyalty_points_earned": 10, "loyalty_points_total": n}
+        or, for a repeated call, {"created": false, "booking": {...}} (the existing booking).
+        A booking has id, customer, date, time, party_size, table, status, notes, created_at.
+
+    Errors:
+        Invalid or past date, time outside opening hours, party size out of range, unknown table,
+        table too small or already taken, no table free (call check_availability for other times).
+    """
+    guest = _guest(guest_id)
+    name = _clean_text(customer, "customer", MAX_NAME_LENGTH, required=True)
+    note_text = _clean_text(notes, "notes", MAX_NOTES_LENGTH)
+    slot = _parse_slot(date, time)
+    _party(party_size)
+    wanted = (table or "").strip().upper()
+    if wanted and wanted not in TABLES:
+        raise ToolError(f"table {wanted!r} does not exist; tables are {', '.join(TABLES)}. "
+                        "Omit `table` to let the server choose.")
+    if wanted and TABLES[wanted] < party_size:
+        raise ToolError(f"table {wanted} seats {TABLES[wanted]}, too small for {party_size} guests. "
+                        "Pick a bigger table or omit `table` to let the server choose.")
+
+    day = slot.date().isoformat()
+    with _db(write=True) as conn:
+        existing = conn.execute(
+            "SELECT * FROM bookings WHERE guest_id=? AND date=? AND time=? AND status='CONFIRMED'",
+            (guest, day, time),
+        ).fetchone()
+        if existing:
+            return {"created": False, "booking": _row_to_booking(existing)}
+
+        free = _free_tables(conn, day, time, party_size)
+        if wanted and wanted not in free:
+            raise ToolError(
+                f"table {wanted} is already booked around {time} on {day} (a booking holds a table for "
+                f"{SEATING_MINUTES // 60} hours). "
+                + (f"Free tables that fit: {', '.join(free)}." if free else "No table is free for this slot.")
+            )
+        if not free:
+            raise ToolError(
+                f"no table for {party_size} guests is free at {time} on {day}. "
+                "Call check_availability to look at other times."
+            )
+        chosen = wanted or free[0]
+        booking_id = f"bk-{uuid.uuid4().hex[:8]}"
+        created_at = _now().isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO bookings(id, guest_id, customer, date, time, party_size, table_id, status, notes, created_at) "
+            "VALUES(?,?,?,?,?,?,?,'CONFIRMED',?,?)",
+            (booking_id, guest, name, day, time, party_size, chosen, note_text, created_at),
+        )
+        total = _loyalty_add(conn, guest, POINTS_PER_BOOKING, f"Booking {booking_id} confirmed")
+    return {
+        "created": True,
+        "booking": {
+            "id": booking_id, "customer": name, "date": day, "time": time, "party_size": party_size,
+            "table": chosen, "status": "CONFIRMED", "notes": note_text, "created_at": created_at,
+        },
+        "loyalty_points_earned": POINTS_PER_BOOKING,
+        "loyalty_points_total": total,
+    }
 
 
-@mcp.tool()
-def get_loyalty(customer: str) -> str:
-    """Show a guest's loyalty points."""
+@_tool(_READ_ONLY)
+def list_bookings(guest_id: GuestId) -> dict[str, Any]:
+    """List one guest's upcoming confirmed bookings (those that have not finished yet).
+
+    Only the guest identified by guest_id is ever returned. Cancelled and past bookings are not
+    listed, and at most 20 are returned.
+
+    Args:
+        guest_id: opaque guest identifier supplied by the agent platform (Zalo user id).
+
+    Returns:
+        {"bookings": [...], "count": n, "truncated": bool} ordered by date and time. Each booking
+        has id, customer, date, time, party_size, table, status, notes, created_at. `truncated`
+        is true when more than 20 upcoming bookings exist and the rest are left out.
+
+    Errors:
+        Missing guest_id.
+    """
+    guest = _guest(guest_id)
+    cutoff = (_now().replace(tzinfo=None) - timedelta(minutes=SEATING_MINUTES)).strftime("%Y-%m-%d %H:%M")
     with _db() as conn:
-        row = conn.execute("SELECT points FROM loyalty WHERE customer=?", (customer,)).fetchone()
-        hist = conn.execute(
-            "SELECT ts, reason FROM loyalty_history WHERE customer=? ORDER BY id DESC LIMIT 20",
-            (customer,),
+        rows = conn.execute(
+            "SELECT * FROM bookings WHERE guest_id=? AND status='CONFIRMED' AND date || ' ' || time > ? "
+            "ORDER BY date, time LIMIT ?",
+            (guest, cutoff, MAX_LIST + 1),
         ).fetchall()
-    return _ok(
-        {
-            "customer": customer,
-            "points": row["points"] if row else 0,
-            "history": [{"time": h["ts"], "reason": h["reason"]} for h in hist],
-        }
-    )
+    bookings = [_row_to_booking(r) for r in rows[:MAX_LIST]]
+    return {"bookings": bookings, "count": len(bookings), "truncated": len(rows) > MAX_LIST}
 
 
-@mcp.tool()
-def add_loyalty_points(customer: str, points: int, reason: str = "") -> str:
-    """Add loyalty points for a guest (for example a birthday bonus). Negative values deduct."""
-    if points == 0:
-        return _err("points must not be 0")
-    with _write_lock, _db() as conn:
-        _loyalty_add(conn, customer, points, reason or "points added")
-        row = conn.execute("SELECT points FROM loyalty WHERE customer=?", (customer,)).fetchone()
-    return _ok({"customer": customer, "points": row["points"]})
+@_tool(_DESTRUCTIVE)
+def cancel_booking(
+    guest_id: GuestId,
+    booking_id: Annotated[str, Field(
+        description="Booking id as returned by create_booking or list_bookings, for example 'bk-1a2b3c4d'.")],
+) -> dict[str, Any]:
+    """Cancel one of the guest's bookings and reverse the loyalty points it earned.
+
+    Confirm with the guest before calling it. A guest can only cancel their own bookings.
+    Cancelling an already cancelled booking changes nothing.
+
+    Args:
+        guest_id: opaque guest identifier supplied by the agent platform (Zalo user id).
+        booking_id: booking id such as 'bk-1a2b3c4d' (from create_booking or list_bookings).
+
+    Returns:
+        {"booking": {...}, "loyalty_points_reversed": 10, "loyalty_points_total": n}; the booking has
+        status CANCELLED. For a booking that was already cancelled, loyalty_points_reversed is 0.
+
+    Errors:
+        Missing guest_id, or no booking with that id for this guest (the same message whether the
+        id does not exist or belongs to someone else).
+    """
+    guest = _guest(guest_id)
+    booking_id = (booking_id or "").strip().lower()
+    with _db(write=True) as conn:
+        row = conn.execute("SELECT * FROM bookings WHERE id=? AND guest_id=?", (booking_id, guest)).fetchone()
+        if row is None:
+            raise ToolError(
+                f"no booking {booking_id!r} found for this guest. Call list_bookings to see the guest's bookings."
+            )
+        booking = _row_to_booking(row)
+        if row["status"] == "CANCELLED":
+            reversed_points = 0
+            balance = conn.execute("SELECT points FROM loyalty WHERE guest_id=?", (guest,)).fetchone()
+            total = balance["points"] if balance else 0
+        else:
+            conn.execute("UPDATE bookings SET status='CANCELLED' WHERE id=?", (booking_id,))
+            booking["status"] = "CANCELLED"
+            reversed_points = POINTS_PER_BOOKING
+            total = _loyalty_add(conn, guest, -POINTS_PER_BOOKING, f"Booking {booking_id} cancelled")
+    return {"booking": booking, "loyalty_points_reversed": reversed_points, "loyalty_points_total": total}
+
+
+@_tool(_READ_ONLY)
+def get_loyalty(guest_id: GuestId) -> dict[str, Any]:
+    """Show a guest's loyalty points and their recent history.
+
+    Points are awarded automatically when a booking is created (10 points) and taken back when it
+    is cancelled; they cannot be set by any tool.
+
+    Args:
+        guest_id: opaque guest identifier supplied by the agent platform (Zalo user id).
+
+    Returns:
+        {"points": n, "history": [{"time", "points", "reason"}]} with the 20 latest changes, newest
+        first. A guest with no activity has 0 points and an empty history.
+
+    Errors:
+        Missing guest_id.
+    """
+    guest = _guest(guest_id)
+    with _db() as conn:
+        row = conn.execute("SELECT points FROM loyalty WHERE guest_id=?", (guest,)).fetchone()
+        hist = conn.execute(
+            "SELECT ts, delta, reason FROM loyalty_history WHERE guest_id=? ORDER BY id DESC LIMIT 20",
+            (guest,),
+        ).fetchall()
+    return {
+        "points": row["points"] if row else 0,
+        "history": [{"time": h["ts"], "points": h["delta"], "reason": h["reason"]} for h in hist],
+    }
 
 
 # ------------------------- HTTP app -------------------------
-
-TOOL_NAMES = ["get_menu", "check_availability", "create_booking", "list_bookings",
-              "cancel_booking", "get_loyalty", "add_loyalty_points"]
 
 
 def _auth_mode() -> str:
