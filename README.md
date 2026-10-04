@@ -39,7 +39,8 @@ The sample was first demonstrated on a demo account with every component on Agen
 | Situation | What the bot does (automatically) |
 |---|---|
 | "I'm Hung, book a table tonight for 4, **no spicy food**" | Checks tables through **MCP** (`check_availability`) → suggests a table • `remember` "Hung, non-spicy" • confirms + `create_booking` |
-| Returns later **via Zalo** (new session): "I'll come back this weekend" | *"Hi Hung! You sat at table T3 last time — the kitchen always cooks non-spicy for you"* — guest profile from the **CUSTOM memory strategy** |
+| Returns the next day **via Zalo** (a new session: sessions rotate daily): "I'll come back this weekend" | *"Hi Hung! You sat at table T3 last time — the kitchen always cooks non-spicy for you"* — the guest profile comes back from the **CUSTOM memory strategy** (`recall`), not from the old chat |
+| "Book me a table for 4 tomorrow at 7 pm" | The bot checks availability, **summarises the booking and asks the guest to confirm**, and only after a clear yes calls `create_booking` (at most once per message). The MCP tools never take a guest id from the model: the agent fills it in from the Zalo sender id |
 | Unknown caller hits `/webhook/zalo` without the secret | **403 Denied** (`X-Bot-Api-Secret-Token` header) |
 
 The **Web Simulator** (`GET /`): a Zalo-style UI (phone frame), add new guests, chat, plus a **Guest profile** panel and an **Upcoming bookings** table for the selected guest (read live from the MCP server with that guest's id). With `AGENT_API_KEY` set the page asks for the key once (`/api/info` reports `auth_required`), keeps it in `sessionStorage` and sends it as `X-API-Key`.
@@ -283,7 +284,7 @@ The simulator works 100% without a Zalo token (the UI shows `zalo_configured=fal
 | `ZALO_MAX_WORKERS` | default `8` | Zalo chats processed at the same time (messages of one chat are always answered in order, one at a time) |
 | `ZALO_API_BASE` | default | `https://bot-api.zaloplatforms.com` |
 | `SERVE_UI` | default `true` | `false` → disable the Web Simulator on the endpoint (Zalo-first mode) |
-| `AGENT_API_KEY` | optional | if set, `/invocations`, `/a2a` and `/api/*` require the `X-API-Key` header; `/api/info` then returns only `{agent, auth_required}` without it (the webhook uses its own Zalo secret and is never blocked; `/health`, `/ready` and the agent card stay open) |
+| `AGENT_API_KEY` | optional | if set, `/invocations`, `/a2a`, `/ready` and `/api/*` require the `X-API-Key` header; `/api/info` then returns only `{agent, auth_required}` without it (the webhook uses its own Zalo secret and is never blocked; the UI, `/health` and the agent card stay open). The `.env.example` placeholder `change-me` is rejected at startup, like every other `change-me` value |
 | `A2A_PUBLIC_URL` | optional | public base URL of this runtime, written into the A2A agent card (`url`); default is the relative `/a2a` |
 | `DEBUG_OPS` | default `0` | `1` enables the `{"op":"whoami"}` identity op — only while setting up policies |
 | `LANGFUSE_HOST` | for traces | self-hosted Langfuse over the private network: `http://<langfuse-private-ip>:3000` |
@@ -317,25 +318,25 @@ Per the AgentBase docs, LLM calls on a Runtime go through a **Sidecar LLM Proxy*
 | GET | `/api/memory?actor=` · `/api/history` · `/api/actors` | guest profile · conversation · known guests (with `AGENT_API_KEY`: `X-API-Key` required) |
 | GET | `/api/bookings?actor=` | calls the MCP `list_bookings` tool directly with `guest_id=<actor>` (that guest's upcoming bookings) |
 | GET | `/api/info` · `/health` | config (includes `zalo_configured`, bot name, `auth_required`); without the API key `/api/info` hides `memory_id` and `mcp_url` |
-| GET | `/ready` | deep readiness: memory + gateway tools + LLM key decide `200 ok` / `503 degraded`; the Zalo `getMe` result is reported under `checks.zalo` for information only (`getMe` is cached 5 minutes, a failure 30 seconds) |
+| GET | `/ready` | (with `AGENT_API_KEY`: needs the key) deep readiness: memory + gateway tools + LLM key decide `200 ok` / `503 degraded`; the Zalo `getMe` result is reported under `checks.zalo` for information only (`getMe` is cached 5 minutes, a failure 30 seconds) |
 
 ## Verified end-to-end (reference demo)
 
-- Hung (no-spicy) → table T3 · Lan (vegetarian, 6 guests, T7) → booking created; a new session later → the bot recalls the profile exactly.
+- Hung (no-spicy) → table T3 · Lan (vegetarian, 6 guests, T7) → booking created; a new session later → the bot recalls the profile exactly. These checks predate the `guest_id` tool contract and the confirmation step described above.
 - Webhook: correct secret → processed + replied (`sent` reflects a real Zalo send); wrong secret → **403**; `setWebhook` returned `verification.ok = true`.
 - Policy Group: an unknown token calling the gateway → 403 *"Request denied by policy."*
 - Tools worked through the gateway on the demo account (its connector used No authorization; the layout in this README uses an API Key). These checks were made on the earlier all-on-AgentBase demo layout. The Private / VPC layout is documented here and its pieces (MCP server auth and persistence, webhook proxy, compose files, Helm values) were exercised individually in local tests, but the full private path depends on the GreenNode items listed in [Verify with GreenNode](#verify-with-greennode).
 
 ## A2A protocol (agent-to-agent)
 
-This agent is an **A2A server** (message/send; no streaming):
+This agent is an **A2A server** (`message/send`, and `message/stream` as an SSE stream of status and artifact updates):
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/.well-known/agent-card.json` | GET | Agent card: name, skill `restaurant-consultation`, capabilities (streaming: no) |
+| `/.well-known/agent-card.json` | GET | Agent card: name, skill `restaurant-consultation`, capabilities (streaming: yes); with `AGENT_API_KEY` set it also advertises the `apiKey` security scheme |
 | `/a2a` | POST | JSON-RPC 2.0 `message/send` → standard A2A `Message` (contextId + text parts) |
 
-- A2A reuses the same `_chat_turn` as chat and the webhook, so A2A conversations **have guest memory** just like regular Zalo conversations.
+- A2A reuses the same turn (`_turn_job`) as chat and the webhook, so A2A conversations **have guest memory** just like regular Zalo conversations.
 - `POST /a2a` is protected by `AGENT_API_KEY` like the other endpoints (send `X-API-Key` when it is set; the agent card advertises the `apiKey` scheme then) and **requires** the `X-GreenNode-AgentBase-User-Id` header (→ memory `actorId`; missing → 400, there is no shared default `a2a` actor). Through AgentBase Runtime the header is attached automatically; when calling directly, send it yourself. If `contextId` is missing, the `X-GreenNode-AgentBase-Session-Id` header is used, and only then a newly generated id.
 - Quick test (the sample message is Vietnamese: "What time does the restaurant close?"):
   ```bash
@@ -346,7 +347,7 @@ This agent is an **A2A server** (message/send; no streaming):
 
 ## Observability — Langfuse v4 (OTel SDK)
 
-Every turn (chat + webhook + A2A) is traced with the **Langfuse Python SDK v4** (`langfuse>=4.0,<5`): `_lf_scope()` (`propagate_attributes`) wraps `_chat_turn`, so the trace name/user/session/tags apply to the root and every child observation; `_lf_callback()` is created inside that scope. Enable it with 3 env vars: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`; if any are missing, tracing is disabled automatically. The Langfuse UI shows the model and token usage for each generation, tool calls (`recall`), and session/user/tags.
+Every turn (chat + webhook + A2A) is traced with the **Langfuse Python SDK v4** (`langfuse>=4.0,<5`): `_traced()` (`propagate_attributes` plus the callback handler) wraps every turn (`_turn_job` / `_stream_job`), so the trace name/user/session/tags apply to the root and every child observation; `_lf_callback()` is created inside that scope. Enable it with 3 env vars: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`; if any are missing, tracing is disabled automatically. The Langfuse UI shows the model and token usage for each generation, tool calls (`recall`), and session/user/tags.
 
 In this deployment Langfuse is **self-hosted and private** in the customer VPC ([`deploy/langfuse`](deploy/langfuse/vserver/README.md)): the agent sends traces to `LANGFUSE_HOST=http://<langfuse-private-ip>:3000` over the private network, and admins open the UI only through the [client-to-site VPN](deploy/admin-vpn/README.md). The server must be a Langfuse v3.x release with OpenTelemetry ingestion (verify the version against the SDK's requirements).
 
@@ -371,7 +372,10 @@ In this deployment Langfuse is **self-hosted and private** in the customer VPC (
 | **Private observability** | Langfuse is reachable only on private IPs and through the VPN |
 | **Data persistence** | the MCP server stores bookings/loyalty in SQLite on a persistent volume / PVC — restarts and redeploys keep data; back it up |
 | **2000-char replies** | a reply longer than the Zalo limit is split on paragraph / sentence boundaries and sent as several messages in order; no part exceeds 2,000 characters |
-| **Context budget** | history trimmed to the last 40 messages; gateway calls retry with backoff; `recall` degrades gracefully |
+| **Context budget** | `SummarizationMiddleware` replaces old messages by a summary once the history reaches about 16k tokens (it never splits a tool call from its result); a turn is capped at 10 model calls and 8 tool calls (`create_booking` once), and a capped turn answers with a Vietnamese apology; a transient LLM error is retried by `ModelRetryMiddleware` (the only retry layer, `ChatOpenAI` runs with `max_retries=0`) |
+| **Daily sessions** | the Zalo session is `zalo-<chat id>-<YYYYMMDD>` (Vietnam date): the checkpointer reads every event of a session on every turn, so a session that never ends would grow forever. Long-term memory carries the guest across days; one checkpoint is written per turn (`durability="exit"`) |
+| **Guest-scoped tools** | the MCP tools that take a `guest_id` get it from the run config (the Zalo sender id); the argument is removed from the schema the model sees and ignored if the model sends one, so the model cannot read or cancel another guest's bookings. The prompt also requires an explicit "yes" from the guest before `create_booking` / `cancel_booking`, and a `ToolCallLimitMiddleware` allows one `create_booking` per turn |
+| **No raw errors** | tool failures reach the model as short messages naming only the exception type; API clients and guests get a generic message plus a request id, never exception text |
 
 ## Tests
 

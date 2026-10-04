@@ -11,7 +11,8 @@
 #                   GET /api/public/health (prints the Langfuse version).
 #   Agent runtime   RUNTIME_URL=http://<private-endpoint>        (endpoint: verify with GreenNode)
 #                   GET /health, then GET /ready (memory, gateway path, and the Zalo getMe call, which shows
-#                   whether the runtime has outbound egress to bot-api.zaloplatforms.com).
+#                   whether the runtime has outbound egress to bot-api.zaloplatforms.com). When the runtime
+#                   sets AGENT_API_KEY, pass it too: AGENT_API_KEY=<key> (sent as X-API-Key to /ready).
 #   Webhook proxy   PROXY_URL=https://zalo-webhook.example.com
 #                   Only POST /webhook/zalo may pass. Other paths and methods must return 404.
 #                   A POST without the Zalo secret must be rejected by the agent (403).
@@ -139,11 +140,14 @@ if [[ -n "$RUNTIME_URL" ]]; then
   if [[ "$code" == "200" ]]; then
     pass "[agent] GET /health -> 200"
     # Deep readiness: Memory, the gateway tools and Zalo getMe (an outbound call from the runtime).
-    resp=$(curl "${CURL_OPTS[@]}" --max-time $((TIMEOUT * 4)) -w '\n%{http_code}' "${RT}/ready" 2>&1)
+    ready_hdrs=()
+    [[ -n "${AGENT_API_KEY:-}" ]] && ready_hdrs=(-H "X-API-Key: ${AGENT_API_KEY}")
+    resp=$(curl "${CURL_OPTS[@]}" --max-time $((TIMEOUT * 4)) ${ready_hdrs[@]+"${ready_hdrs[@]}"} -w '\n%{http_code}' "${RT}/ready" 2>&1)
     code=$(printf '%s' "$resp" | tail -n1)
     out=$(printf '%s' "$resp" | sed '$d')
     case "$code" in
       200) pass "[agent] GET /ready -> 200 (memory and gateway tools respond, LLM key set)" ;;
+      401) fail "[agent] GET /ready -> 401" "the runtime sets AGENT_API_KEY: run the script with AGENT_API_KEY=<key>" ;;
       503) fail "[agent] GET /ready -> 503 (degraded)" "${out:0:300}" ;;
       *)   fail "[agent] GET /ready -> ${code:-no response}" "${out:0:200}" ;;
     esac

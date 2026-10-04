@@ -84,7 +84,7 @@ The API reference in the documentation reviewed for this sample does not list th
 | `ZALO_MAX_WORKERS` | optional | Zalo chats processed at the same time, default `8` | no |
 | `ZALO_API_BASE` | default | `https://bot-api.zaloplatforms.com` | no |
 | `SERVE_UI` | set `false` | disables the web simulator on the endpoint (Zalo-first) | no |
-| `AGENT_API_KEY` | recommended | protects `/invocations`, `/a2a` and `/api/*` with `X-API-Key` | **yes** |
+| `AGENT_API_KEY` | recommended | protects `/invocations`, `/a2a`, `/ready` and `/api/*` with `X-API-Key` | **yes** |
 | `A2A_PUBLIC_URL` | optional | public base URL of the runtime for the A2A agent card | no |
 | `DEBUG_OPS` | keep `0` | `1` only while reading the principal for the gateway policy | no |
 
@@ -160,7 +160,7 @@ Not tested through a real proxy on a runtime, and whether the runtime accepts th
 
    ```bash
    RUNTIME_URL=http://<private-endpoint> ../check_connectivity.sh       # GET /health -> 200
-   curl -s http://<private-endpoint>/ready                              # memory, gateway path and Zalo getMe (egress)
+   curl -s -H "X-API-Key: $AGENT_API_KEY" http://<private-endpoint>/ready   # memory, gateway path and Zalo getMe (egress); the key is needed when AGENT_API_KEY is set
    ```
 
    `/ready` returns `200` when Memory and the gateway tools respond and `LLM_API_KEY` is set; `checks.zalo.bot` is the bot name when the `getMe` call to Zalo worked (egress); it never changes the `200` / `503` status. The result is cached for 5 minutes on success and 30 seconds on failure, so after fixing egress it recovers on its own within half a minute. The `getMe` call is not made at all when `ZALO_BOT_TOKEN` is unset.
